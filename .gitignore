@@ -6,3 +6,5 @@ out/
 *.key
 *.key.*
 *.pem
+
+.acceptance/

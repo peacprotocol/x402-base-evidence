@@ -1,0 +1,8 @@
+# Secret-scanning configuration.
+#
+# The default rule set is used in full, with no repository-specific allowlist. This repository
+# commits no signed PEAC record; a committed record would be public verification material, not a
+# credential, and would need a narrowly scoped allowlist entry.
+
+[extend]
+useDefault = true

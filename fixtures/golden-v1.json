@@ -1,0 +1,215 @@
+{
+  "_comment": "Deterministic validation vectors with hard-coded expected bytes and digests. Regenerate via pnpm gen:golden and review the diff.",
+  "profileRequestBinding": "org.peacprotocol.examples.payment-evidence/request-binding/1",
+  "profileOriginResultBinding": "org.peacprotocol.examples.payment-evidence/origin-result-binding/1",
+  "requestBinding": {
+    "profile": "org.peacprotocol.examples.payment-evidence/request-binding/1",
+    "components": {
+      "@method": "GET",
+      "@scheme": "https",
+      "@authority": "api.example.test",
+      "@path": "/v1/forecast",
+      "@query": "?region=alpha&units=metric",
+      "capturePoint": "origin_request_after_http_parsing",
+      "proxyTrustProfile": "direct-origin"
+    },
+    "bodyDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "selectedHeaders": [
+      {
+        "name": "payment-signature",
+        "observedValueDigest": "sha256:9f1a837d55b4e7a48a870f0ecf7bbcc72faa4d7c0953dab8df8d6948a7e98b32"
+      }
+    ]
+  },
+  "requestBindingJcsUtf8Hex": "7b22626f6479446967657374223a227368613235363a65336230633434323938666331633134396166626634633839393666623932343237616534316534363439623933346361343935393931623738353262383535222c22636f6d706f6e656e7473223a7b2240617574686f72697479223a226170692e6578616d706c652e74657374222c22406d6574686f64223a22474554222c224070617468223a222f76312f666f726563617374222c22407175657279223a223f726567696f6e3d616c70686126756e6974733d6d6574726963222c2240736368656d65223a226874747073222c2263617074757265506f696e74223a226f726967696e5f726571756573745f61667465725f687474705f70617273696e67222c2270726f7879547275737450726f66696c65223a226469726563742d6f726967696e227d2c2270726f66696c65223a226f72672e7065616370726f746f636f6c2e6578616d706c65732e7061796d656e742d65766964656e63652f726571756573742d62696e64696e672f31222c2273656c656374656448656164657273223a5b7b226e616d65223a227061796d656e742d7369676e6174757265222c226f6273657276656456616c7565446967657374223a227368613235363a39663161383337643535623465376134386138373066306563663762626363373266616134643763303935336461623864663864363934386137653938623332227d5d7d",
+  "requestBindingDigest": "sha256:685db0f4d450eaa042d52af6895f8d8585860d604a18dc6de7b83e1af8cd244b",
+  "originResultBinding": {
+    "profile": "org.peacprotocol.examples.payment-evidence/origin-result-binding/1",
+    "status": 200,
+    "contentType": "application/json",
+    "bodyDigest": "sha256:5f564269ae83a2ab0cde2d8de9fed2921ffa95e67aa7fa6035884c93bce3087c",
+    "capturePoint": "origin_pre_transfer_encoding"
+  },
+  "originResultBindingJcsUtf8Hex": "7b22626f6479446967657374223a227368613235363a35663536343236396165383361326162306364653264386465396665643239323166666139356536376161376661363033353838346339336263653330383763222c2263617074757265506f696e74223a226f726967696e5f7072655f7472616e736665725f656e636f64696e67222c22636f6e74656e7454797065223a226170706c69636174696f6e2f6a736f6e222c2270726f66696c65223a226f72672e7065616370726f746f636f6c2e6578616d706c65732e7061796d656e742d65766964656e63652f6f726967696e2d726573756c742d62696e64696e672f31222c22737461747573223a3230307d",
+  "originResultBindingDigest": "sha256:ea22f378381de6decceb275b26126380c04475b92f95d92bca6616a048b6a59c",
+  "originResultBodyDigest": "sha256:5f564269ae83a2ab0cde2d8de9fed2921ffa95e67aa7fa6035884c93bce3087c",
+  "requestBodyDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "settleResponseLocalStructuralAuthority": "x402-base-evidence/local-settle-response-shape@1",
+  "observedHeaders": {
+    "payment-required": {
+      "name": "payment-required",
+      "artifactType": "PaymentRequired",
+      "observedValue": "eyJ4NDAyVmVyc2lvbiI6MiwicmVzb3VyY2UiOnsidXJsIjoiaHR0cHM6Ly9hcGkuZXhhbXBsZS50ZXN0L3YxL2ZvcmVjYXN0P3JlZ2lvbj1hbHBoYSZ1bml0cz1tZXRyaWMiLCJkZXNjcmlwdGlvbiI6IlN5bnRoZXRpYyBmb3JlY2FzdCByZXNvdXJjZSB1c2VkIGJ5IHRoZSBkZXRlcm1pbmlzdGljIGZpeHR1cmVzIiwibWltZVR5cGUiOiJhcHBsaWNhdGlvbi9qc29uIn0sImFjY2VwdHMiOlt7InNjaGVtZSI6ImV4YWN0IiwibmV0d29yayI6ImVpcDE1NTo4NDUzMiIsImFzc2V0IjoiMHgwMzZDYkQ1Mzg0MmM1NDI2NjM0ZTc5Mjk1NDFlQzIzMThmM2RDRjdlIiwiYW1vdW50IjoiMjUwMDAwIiwicGF5VG8iOiIweDBhNDE5Y2I0NTE3YWJkMDhmODA5NDAwY2M2YTEyMzZmNDFlZTY5MTkiLCJtYXhUaW1lb3V0U2Vjb25kcyI6NjAsImV4dHJhIjp7Im5hbWUiOiJVU0RDIiwidmVyc2lvbiI6IjIifX1dLCJleHRlbnNpb25zIjp7InBheW1lbnQtaWRlbnRpZmllciI6eyJpbmZvIjp7InJlcXVpcmVkIjp0cnVlfSwic2NoZW1hIjp7IiRzY2hlbWEiOiJodHRwczovL2pzb24tc2NoZW1hLm9yZy9kcmFmdC8yMDIwLTEyL3NjaGVtYSIsInR5cGUiOiJvYmplY3QiLCJwcm9wZXJ0aWVzIjp7InJlcXVpcmVkIjp7InR5cGUiOiJib29sZWFuIn0sImlkIjp7InR5cGUiOiJzdHJpbmciLCJtaW5MZW5ndGgiOjE2LCJtYXhMZW5ndGgiOjEyOCwicGF0dGVybiI6Il5bYS16QS1aMC05Xy1dKyQifX0sInJlcXVpcmVkIjpbInJlcXVpcmVkIl19fX19",
+      "observedValueDigest": "sha256:94f96ae77f5237e2b90582c3e21850df906294dd7dc5c017f56fd51a686c5890",
+      "stages": {
+        "transport": "accepted",
+        "json": "accepted",
+        "duplicate-members": "accepted",
+        "upstream-schema": "accepted",
+        "scheme-payload": "not_evaluated",
+        "extensions": "not_evaluated"
+      },
+      "diagnostics": [],
+      "upstreamSchemaAuthority": "@x402/core@2.23.0/schemas",
+      "capturePoint": "client_response_after_http_parsing",
+      "httpVersion": "2.0",
+      "decodedPayloadDigest": "sha256:e65dbb706489c86d474a609e7f891f7537f9e28fbb7fadd9041c6eeb36fc5ab8",
+      "decoded": {
+        "x402Version": 2,
+        "resource": {
+          "url": "https://api.example.test/v1/forecast?region=alpha&units=metric",
+          "description": "Synthetic forecast resource used by the deterministic fixtures",
+          "mimeType": "application/json"
+        },
+        "accepts": [
+          {
+            "scheme": "exact",
+            "network": "eip155:84532",
+            "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+            "amount": "250000",
+            "payTo": "0x0a419cb4517abd08f809400cc6a1236f41ee6919",
+            "maxTimeoutSeconds": 60,
+            "extra": {
+              "name": "USDC",
+              "version": "2"
+            }
+          }
+        ],
+        "extensions": {
+          "payment-identifier": {
+            "info": {
+              "required": true
+            },
+            "schema": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "required": {
+                  "type": "boolean"
+                },
+                "id": {
+                  "type": "string",
+                  "minLength": 16,
+                  "maxLength": 128,
+                  "pattern": "^[a-zA-Z0-9_-]+$"
+                }
+              },
+              "required": [
+                "required"
+              ]
+            }
+          }
+        }
+      },
+      "validatedObjectJcsDigest": "sha256:cdf89ad25a654283fe096f08157b7549d83d2756343e2cf456d9c064a55b9a15"
+    },
+    "payment-signature": {
+      "name": "payment-signature",
+      "artifactType": "PaymentPayload",
+      "observedValue": "eyJ4NDAyVmVyc2lvbiI6MiwicmVzb3VyY2UiOnsidXJsIjoiaHR0cHM6Ly9hcGkuZXhhbXBsZS50ZXN0L3YxL2ZvcmVjYXN0P3JlZ2lvbj1hbHBoYSZ1bml0cz1tZXRyaWMiLCJkZXNjcmlwdGlvbiI6IlN5bnRoZXRpYyBmb3JlY2FzdCByZXNvdXJjZSB1c2VkIGJ5IHRoZSBkZXRlcm1pbmlzdGljIGZpeHR1cmVzIiwibWltZVR5cGUiOiJhcHBsaWNhdGlvbi9qc29uIn0sImFjY2VwdGVkIjp7InNjaGVtZSI6ImV4YWN0IiwibmV0d29yayI6ImVpcDE1NTo4NDUzMiIsImFzc2V0IjoiMHgwMzZDYkQ1Mzg0MmM1NDI2NjM0ZTc5Mjk1NDFlQzIzMThmM2RDRjdlIiwiYW1vdW50IjoiMjUwMDAwIiwicGF5VG8iOiIweDBhNDE5Y2I0NTE3YWJkMDhmODA5NDAwY2M2YTEyMzZmNDFlZTY5MTkiLCJtYXhUaW1lb3V0U2Vjb25kcyI6NjAsImV4dHJhIjp7Im5hbWUiOiJVU0RDIiwidmVyc2lvbiI6IjIifX0sInBheWxvYWQiOnsiYXV0aG9yaXphdGlvbiI6eyJmcm9tIjoiMHhhZjc1ZmZhN2ZmZTM1ZjQ5MTUxNjc0NmJmMGUwMWE1NzYxNjliMjdiIiwidG8iOiIweDBhNDE5Y2I0NTE3YWJkMDhmODA5NDAwY2M2YTEyMzZmNDFlZTY5MTkiLCJ2YWx1ZSI6IjI1MDAwMCIsInZhbGlkQWZ0ZXIiOiIxNzg0OTk5OTQwIiwidmFsaWRCZWZvcmUiOiIxNzg1MDAwMDYwIiwibm9uY2UiOiIweGFlZWJjYmM1MzZkN2JhNDAwN2QyYzFkM2MyN2MxMDk3MDY4MTQzOWVjY2JlMWNiNzQ4MjkxMjRjOTMzZGZhYzAifSwic2lnbmF0dXJlIjoiMHg1MTljN2E0YWE5YzVkMjFhOWZlOGMyOWEwOTU0ZmViZmZhYjRkZTQ0MTkxYjlkOTE2MDE5MDRlYTU3Y2YwY2MxYjYxZTllM2Q0YzUzNmIyOThkMzA2M2UwMzM2ODFkMTVkOTAyNmRjNDAyNjliNTBmMThiYzFkOWM5ZTYyMDU2NzFiIn0sImV4dGVuc2lvbnMiOnsicGF5bWVudC1pZGVudGlmaWVyIjp7ImluZm8iOnsicmVxdWlyZWQiOnRydWUsImlkIjoicGF5XzAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBmMXgyIn0sInNjaGVtYSI6eyIkc2NoZW1hIjoiaHR0cHM6Ly9qc29uLXNjaGVtYS5vcmcvZHJhZnQvMjAyMC0xMi9zY2hlbWEiLCJ0eXBlIjoib2JqZWN0IiwicHJvcGVydGllcyI6eyJyZXF1aXJlZCI6eyJ0eXBlIjoiYm9vbGVhbiJ9LCJpZCI6eyJ0eXBlIjoic3RyaW5nIiwibWluTGVuZ3RoIjoxNiwibWF4TGVuZ3RoIjoxMjgsInBhdHRlcm4iOiJeW2EtekEtWjAtOV8tXSskIn19LCJyZXF1aXJlZCI6WyJyZXF1aXJlZCJdfX19fQ==",
+      "observedValueDigest": "sha256:9f1a837d55b4e7a48a870f0ecf7bbcc72faa4d7c0953dab8df8d6948a7e98b32",
+      "stages": {
+        "transport": "accepted",
+        "json": "accepted",
+        "duplicate-members": "accepted",
+        "upstream-schema": "accepted",
+        "scheme-payload": "accepted",
+        "extensions": "accepted"
+      },
+      "diagnostics": [],
+      "upstreamSchemaAuthority": "@x402/core@2.23.0/schemas",
+      "capturePoint": "origin_request_after_http_parsing",
+      "httpVersion": "2.0",
+      "decodedPayloadDigest": "sha256:a7d8b15674dba893dd663222b5c729cb2d16e213249d7b12a4c671adeaf452f1",
+      "decoded": {
+        "x402Version": 2,
+        "resource": {
+          "url": "https://api.example.test/v1/forecast?region=alpha&units=metric",
+          "description": "Synthetic forecast resource used by the deterministic fixtures",
+          "mimeType": "application/json"
+        },
+        "accepted": {
+          "scheme": "exact",
+          "network": "eip155:84532",
+          "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+          "amount": "250000",
+          "payTo": "0x0a419cb4517abd08f809400cc6a1236f41ee6919",
+          "maxTimeoutSeconds": 60,
+          "extra": {
+            "name": "USDC",
+            "version": "2"
+          }
+        },
+        "payload": {
+          "authorization": {
+            "from": "0xaf75ffa7ffe35f491516746bf0e01a576169b27b",
+            "to": "0x0a419cb4517abd08f809400cc6a1236f41ee6919",
+            "value": "250000",
+            "validAfter": "1784999940",
+            "validBefore": "1785000060",
+            "nonce": "0xaeebcbc536d7ba4007d2c1d3c27c10970681439eccbe1cb74829124c933dfac0"
+          },
+          "signature": "0x519c7a4aa9c5d21a9fe8c29a0954febffab4de44191b9d91601904ea57cf0cc1b61e9e3d4c536b298d3063e033681d15d9026dc40269b50f18bc1d9c9e6205671b"
+        },
+        "extensions": {
+          "payment-identifier": {
+            "info": {
+              "required": true,
+              "id": "pay_0000000000000000000000000000f1x2"
+            },
+            "schema": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "required": {
+                  "type": "boolean"
+                },
+                "id": {
+                  "type": "string",
+                  "minLength": 16,
+                  "maxLength": 128,
+                  "pattern": "^[a-zA-Z0-9_-]+$"
+                }
+              },
+              "required": [
+                "required"
+              ]
+            }
+          }
+        }
+      },
+      "validatedObjectJcsDigest": "sha256:8577cc03961a6044f009e64d5e7441e03c9525f510a4c7524b9738158b7755d5"
+    },
+    "payment-response": {
+      "name": "payment-response",
+      "artifactType": "SettleResponse",
+      "observedValue": "eyJzdWNjZXNzIjp0cnVlLCJ0cmFuc2FjdGlvbiI6IjB4MTMxNjU1ZDdmMGJlZTc4NTk2MmVlMWM0MTQzMTY3MjU5MzI3OWE0OWIzY2MwMTBlNDY3YzZiMjQyN2MzY2JmZiIsIm5ldHdvcmsiOiJlaXAxNTU6ODQ1MzIiLCJwYXllciI6IjB4YWY3NWZmYTdmZmUzNWY0OTE1MTY3NDZiZjBlMDFhNTc2MTY5YjI3YiJ9",
+      "observedValueDigest": "sha256:bf0b4a490ecb29aa8ba3f924ccb7cb12a6682bac4b346264f7e540310d4fc755",
+      "stages": {
+        "transport": "accepted",
+        "json": "accepted",
+        "duplicate-members": "accepted",
+        "upstream-schema": "not_evaluated",
+        "scheme-payload": "not_evaluated",
+        "extensions": "not_evaluated"
+      },
+      "diagnostics": [],
+      "upstreamSchemaAuthority": "@x402/core@2.23.0/schemas",
+      "capturePoint": "origin_response_before_gateway",
+      "httpVersion": "2.0",
+      "localStructural": {
+        "upstreamSchemaStatus": "not_evaluated",
+        "localStructuralStatus": "accepted",
+        "localStructuralAuthority": "x402-base-evidence/local-settle-response-shape@1"
+      },
+      "decodedPayloadDigest": "sha256:13d4c0300395a9f57c328cc8a3b7b9aa2869314640556ec27f6f8f8a9eb2b866",
+      "decoded": {
+        "success": true,
+        "transaction": "0x131655d7f0bee785962ee1c41431672593279a49b3cc010e467c6b2427c3cbff",
+        "network": "eip155:84532",
+        "payer": "0xaf75ffa7ffe35f491516746bf0e01a576169b27b"
+      },
+      "validatedObjectJcsDigest": "sha256:6c16260da6b0db28ca71c0f81cac0582145130a304bab2c8f4c983457916b028"
+    }
+  }
+}
