@@ -1,12 +1,15 @@
 # x402 Base Evidence
 
-Non-normative validation and binding reference for the x402 v2 `exact` scheme using the EIP-3009
-asset-transfer method on Base: staged validation of native x402 payment artifacts against the
-upstream runtime validators, and origin-observed HTTP request/result binding through RFC 9421
-request-component derivation and JCS canonicalization, with a deterministic validation corpus.
+Non-normative reference implementation for the x402 v2 `exact` scheme using the EIP-3009
+asset-transfer method on Base: a complete paid-resource flow over the upstream x402 middleware,
+staged validation of native x402 payment artifacts against the upstream runtime validators,
+origin-observed HTTP request/result binding through RFC 9421 request-component derivation and JCS
+canonicalization, a Base settlement-observation layer with an explicit sealed-L2 contract, signed
+PEAC record issuance over the resulting digests, and offline verification of that record under a
+supplied public key, with a deterministic validation corpus and a byte-reproducible offline
+end-to-end fixture.
 
-Live Base execution, Base RPC settlement observation, PEAC record issuance and live tamper
-verification are outside this repository's current implemented scope; see
+A live Base Sepolia execution of this flow has not yet been performed from this repository; see
 [§4 Current implementation status](#4-current-implementation-status).
 
 Independent open-source reference implementation; not an endorsement or official implementation of
@@ -32,16 +35,25 @@ between the two repositories, and none is introduced by this note).
   (JCS) canonicalization.
 - A deterministic validation corpus: fixtures built against real upstream x402 types, golden vectors
   with hard-coded expected digests, and a rejection corpus covering the failure modes below.
+- A reference paid-resource flow: an express origin behind the upstream x402 payment middleware, a
+  paying client, an in-process fixture facilitator and wallet stand-in for the offline path, and a
+  deterministic end-to-end run whose committed evidence is byte-identical across runs.
+- A Base settlement-observation layer that keeps what the native x402 artifacts said should happen
+  (`payment_expectation`) structurally apart from what was observed afterwards
+  (`chain_observation`), records a sealed-L2 RPC account separately when one was asked, and writes
+  an explicit expected-versus-observed comparison instead of merging the two into one truth claim.
+- Signed PEAC record issuance covering the binding and observation digests, and an offline verifier
+  that recomputes every bound digest, holds the artifact set to a per-terminal-state presence
+  contract, and reports observer disagreement as a warning rather than resolving it.
 - The Base/EVM counterpart to the network-neutral validation and binding patterns first published
   in the Solana reference, reused here rather than shared as a dependency.
 
 ## 2. What this is not
 
-- **Not a live payment flow.** No chain interaction, no facilitator call, no Base Sepolia
-  transaction; see [§4](#4-current-implementation-status).
-  Nothing here executes a payment or holds funds.
-- **Not PEAC record issuance.** This repository does not issue or offline-verify a signed PEAC
-  record; it produces unsigned, application-local binding documents only.
+- **Not a live-proven payment flow yet.** The flow is complete and exercised offline against an
+  in-process facilitator and wallet stand-in; no real Base Sepolia transaction has been executed
+  from this repository, and no output of the offline path may be presented as a payment having been
+  made.
 - **Not an x402 conformance authority.** Validation authority is always named per artifact
   ([§6](#6-validation-and-acceptance-model)); nothing here should be read as an x402 standards body
   or as speaking for the x402 project.
@@ -53,11 +65,17 @@ between the two repositories, and none is introduced by this note).
 
 ## 3. Verification boundary
 
-Recomputing a binding digest establishes whether the supplied binding document matches the
-referenced digest. This repository computes those digests; it does not verify signatures. Where a
-binding digest is covered by a signed PEAC record — not issued or verified by this repository —
-record verification additionally checks the signed record and its signature under the public key
-supplied to the verifier.
+This repository captures native x402 artifacts and validates selected structure; computes
+request/result binding documents and deterministic digests; issues a signed PEAC record covering
+those digests; and verifies that record offline under a supplied public key.
+
+It still does not establish: external truth; client receipt; chain finality; signer authority or
+trust; completeness; issuer truthfulness; or a matching payment from `receipt_status` alone.
+
+Verification establishes integrity and internal consistency under the supplied key — never external
+truth. A supplied public key is not a trust anchor: it makes the record cryptographically
+verifiable, and it says nothing about who holds the private key. A key obtained from the same place
+as the evidence establishes internal consistency only.
 
 It does **not** establish:
 
@@ -73,10 +91,17 @@ establishes the integrity of that report; it does not establish blockchain conse
 not make the issuer's account of events authoritative.
 
 Base distinguishes Flashblock preconfirmation, sealed L2 block inclusion, L1 batch inclusion and L1
-finality. This repository currently implements no chain-observation layer. Any observation
-implementation must record the named source and the observation level actually established; an EVM
-receipt's execution status is not a finality claim. Disagreement between two separately sourced
-observations is reported as a disagreement, not resolved into either side being authoritative.
+finality. The observation layer here records **sealed L2 block inclusion only**, and only after
+comparing the transaction's reported block number and hash against sealed block data queried by
+explicit block number: for Base's documented public HTTP JSON-RPC the caller's block tag selects
+the confirmation semantics, so the canonical observation never uses the `pending` tag, and sealed
+inclusion is never inferred from the mere existence of a transaction receipt. `receipt_status` is
+the EVM execution result and nothing else — not an inclusion level, not finality, and not by itself
+evidence that the expected payment occurred; matching-payment evidence additionally requires the
+expected token, from, to and value transfer event plus native x402 validation. L1 batch inclusion
+and L1 finality are never claimed unless separately observed, and no such observation is
+implemented. Disagreement between two separately sourced observations is reported as a
+disagreement, not resolved into either side being authoritative.
 
 ## 4. Current implementation status
 
@@ -89,9 +114,11 @@ observations is reported as a disagreement, not resolved into either side being 
 | field-value capture and staged validation | implemented |
 | request binding and origin-result binding | implemented |
 | deterministic validation vectors and rejection corpus | implemented |
-| end-to-end payment flow | not implemented in this repository |
-| PEAC signed record issuance and offline verification | not implemented in this repository |
-| chain interaction, Base Sepolia settlement observation | not implemented in this repository |
+| end-to-end payment flow | implemented; exercised offline against an in-process facilitator |
+| PEAC signed record issuance and offline verification | implemented |
+| settlement observation layer (sealed-L2 contract) | implemented; exercised against synthetic sealed sources |
+| live Base Sepolia execution and live settlement observation | not yet performed from this repository |
+| x402 signed offers and receipts | preserved when present inside captured field values; not enabled in the deterministic fixture (see [§9](#9-relationship-to-peac-x402-and-base)) |
 | scheme `upto` | out of scope |
 | batch settlement | out of scope |
 | streaming responses | out of scope |
@@ -105,8 +132,11 @@ observations is reported as a disagreement, not resolved into either side being 
 corepack enable
 pnpm install
 pnpm test          # ledger reset, imports, deterministic validation vectors, rejection corpus,
+                    # offline end-to-end flow, security/replay/binding/tamper matrix,
                     # acceptance matrix, typechecks
-pnpm demo:fixture  # readable walkthrough of the staged validation and binding output
+pnpm demo:fixture  # offline end-to-end run; rewrites the committed evidence byte-identically
+pnpm verify        # offline verification of the committed evidence
+pnpm tamper-demo   # edit one bound field in a copy, watch the named check fail
 ```
 
 ### Run
@@ -122,13 +152,25 @@ pnpm test:golden                 # deterministic validation vectors, staged-vali
                                   # golden-vector drift check
 pnpm test:negative                # rejection corpus
 pnpm test:ledger-integrity       # proves stale ledger state cannot mask an omitted case
+pnpm test:flow                   # offline end-to-end flow (also run under plain node)
+pnpm test:evm                    # security, replay, evidence, binding and tamper matrix
 pnpm test:acceptance             # every declared acceptance case executed
 pnpm typecheck                   # TypeScript 7, primary
 pnpm typecheck:compat            # TypeScript 6, compatibility gate
-pnpm demo:fixture                # deterministic walkthrough
-pnpm demo:offline                # same walkthrough with egress diagnostics installed
+pnpm demo:binding                # deterministic walkthrough of the binding layer
+pnpm demo:fixture                # offline end-to-end run; rewrites the committed evidence
+pnpm demo:offline                # binding walkthrough with egress diagnostics installed
+pnpm verify                      # offline verification: files and a public key, nothing else
+pnpm verify -- --evidence <dir> --public-key <file>   # verify any evidence directory
+pnpm tamper-demo                 # one edited field, one named failure
+pnpm demo:live:prepare           # Base Sepolia preflight (the only network-using command)
 pnpm gen:golden                  # regenerate the vectors, then review the diff
 ```
+
+The offline end-to-end run writes `fixtures/expected-evidence/`: a signed record, the two binding
+documents, the chain-observation document, the captured field values, the origin result bytes, and
+a verification report. Every file is byte-identical across runs; the determinism note inside the
+directory states exactly which inputs are pinned to achieve that, and that no payment occurred.
 
 Fixtures are synthetic. The network is Base Sepolia (`eip155:84532`, declared as an explicit local
 constant) and the asset is the public Base Sepolia USDC contract, taken from the upstream package's
@@ -230,8 +272,9 @@ The exact EVM payload carries a REQUIRED 65-byte EIP-712 `signature` alongside t
 `authorization` object; x402 v2 marks both Required. This reference validates the required field
 shapes and nothing more. It does NOT recover or cryptographically verify the authorization signer.
 Signature validity, payer recovery, validity-window checks and matching against the payment
-requirement remain native x402 and facilitator semantics. Transaction-sender observation is outside
-the currently implemented scope.
+requirement remain native x402 and facilitator semantics. The observation layer records the
+transaction sender as an observed fact from the RPC account; it never treats the broadcaster as
+payment authority merely because it submitted the transaction.
 
 ### Type-states
 
@@ -350,6 +393,15 @@ that, and nothing else:
 
 Native x402 artifacts remain authoritative for their own claims. This example preserves, digests and
 references them; it does not reinterpret settlement semantics or replace native signature checks.
+
+x402's signed offers and receipts travel inside the `PAYMENT-REQUIRED` and settlement response
+surfaces. When a flow carries them, this example preserves them exactly as it preserves every other
+captured field value: verbatim inside the captured artifact, covered by that artifact's digest. The
+deterministic fixture does not enable the offer-receipt extension, because the upstream extension
+stamps offer expiry and receipt issuance times from the process clock with no injection point, and
+the committed fixture evidence is required to be byte-identical across runs. Offers and receipts
+remain native x402 artifacts and remain authoritative for what they attest; nothing here replaces
+them.
 Base is referenced here only as the target network for the EVM `exact` scheme; this repository has no
 relationship with Base, Coinbase, the x402 Foundation or Circle beyond using their public
 specifications and packages.

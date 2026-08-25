@@ -36,18 +36,14 @@ counterparties.
 
 ## Verification boundary
 
-Two different things are described below. They are separated deliberately, because a generic
-statement about "successful verification" would otherwise read as though this repository performed
-signature verification, which it does not.
+This repository captures native x402 artifacts and validates selected structure; computes
+request/result binding documents and deterministic digests; issues a signed PEAC record covering
+those digests; and verifies that record offline under a public key supplied to the verifier.
 
-**This repository** captures and validates selected x402 artifact structure, computes request and
-origin-result binding documents with deterministic digests, and can compare a supplied document
-against a referenced digest. It issues no signed record and verifies no signature.
+Verification establishes integrity and internal consistency under the supplied key — never external
+truth. A supplied public key is not a trust anchor.
 
-**Separate PEAC signing and verification tooling** may issue a signed PEAC record covering those
-digests, and may verify such a signature under a public key supplied to the verifier.
-
-Neither establishes:
+It still does not establish:
 
 - external truth, or that any event described actually occurred;
 - that a counterparty received a response;
@@ -55,11 +51,15 @@ Neither establishes:
 - that a key, or its holder, is authoritative or trustworthy;
 - that the captured artifacts are a complete account of an interaction;
 - that the issuer's statements are truthful;
-- that a matching payment succeeded. A reported receipt status (a `receipt_status`-style field, which
-  this repository does not itself emit) records what a source said under its own application policy;
-  it is not evidence of a settled, matching payment.
+- that a matching payment succeeded. A reported `receipt_status` records the EVM execution result a
+  source reported; it is not evidence of a settled, matching payment. Matching-payment evidence
+  additionally requires the expected token, from, to and value transfer event plus native x402
+  validation.
 
 Base distinguishes Flashblock preconfirmation, sealed L2 block inclusion, L1 batch inclusion and L1
-finality. This repository implements no chain-observation layer. Any observation implementation must
-record the named source and the observation level actually established; an EVM receipt's execution
-status is not a finality claim.
+finality. The observation layer in this repository records sealed L2 block inclusion only, with the
+named source and the observation level actually established: the canonical observation never uses
+the `pending` block tag, sealed inclusion is recorded only after the reported block number and hash
+agree with sealed block data queried by explicit block number, and it is never inferred from the
+mere existence of a transaction receipt. An EVM receipt's execution status is not a finality claim,
+and L1 batch inclusion and L1 finality are never claimed unless separately observed.
