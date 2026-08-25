@@ -2,10 +2,43 @@
   "name": "x402-base-evidence",
   "version": "0.1.0",
   "private": true,
-  "description": "Non-normative validation and binding reference for the x402 v2 exact scheme on Base.",
+  "type": "module",
+  "description": "Non-normative validation and binding reference for the x402 v2 exact scheme using the EIP-3009 asset-transfer method on Base.",
   "license": "Apache-2.0",
   "engines": {
     "node": "^22.13.0 || ^24.0.0"
   },
-  "packageManager": "pnpm@11.23.0+sha512.f00082e5b283a199b74e079da28d155c008fe232f44c8a06ea7ddfa014ecf719fc362f790ecc67b28106ddac2afb24c49a9a079159da560b2ce7d1e98efd11af"
+  "packageManager": "pnpm@11.23.0+sha512.f00082e5b283a199b74e079da28d155c008fe232f44c8a06ea7ddfa014ecf719fc362f790ecc67b28106ddac2afb24c49a9a079159da560b2ce7d1e98efd11af",
+  "scripts": {
+    "fixture": "tsx src/fixture-demo.ts",
+    "demo:fixture": "tsx src/fixture-demo.ts",
+    "demo:offline": "tsx src/fixture-demo-offline.ts",
+    "test": "pnpm test:reset && pnpm test:imports && pnpm test:golden && pnpm test:negative && pnpm test:ledger-integrity && pnpm test:acceptance && pnpm typecheck && pnpm typecheck:compat",
+    "test:reset": "tsx src/acceptance-reset.ts",
+    "test:imports": "tsx src/imports-smoke.ts",
+    "test:golden": "tsx src/test-golden.ts",
+    "test:negative": "tsx src/test-negative.ts",
+    "test:ledger-integrity": "tsx src/test-ledger-integrity.ts",
+    "test:acceptance": "tsx src/test-acceptance.ts",
+    "gen:golden": "tsx src/gen-golden.ts",
+    "typecheck": "tsc --noEmit",
+    "typecheck:compat": "./run-ts-compat.sh"
+  },
+  "dependencies": {
+    "@peac/crypto": "0.16.4",
+    "@peac/kernel": "0.16.4",
+    "@peac/protocol": "0.16.4",
+    "@peac/schema": "0.16.4",
+    "@x402/core": "2.23.0",
+    "@x402/evm": "2.23.0",
+    "@x402/express": "2.23.0",
+    "@x402/extensions": "2.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "@typescript/typescript6": "6.0.2",
+    "ajv": "8.20.0",
+    "tsx": "4.23.12",
+    "typescript": "7.0.2"
+  }
 }

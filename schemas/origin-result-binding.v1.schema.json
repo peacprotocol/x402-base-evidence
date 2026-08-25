@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://peacprotocol.org/examples/payment-evidence/origin-result-binding/1",
+  "$comment": "$id is a namespace identifier, not a retrieval promise: this URL is not guaranteed to be dereferenceable.",
+  "title": "Payment-evidence example origin-result binding (non-normative)",
+  "description": "Application-local profile for this example. Binds the bytes the origin application produced before transfer encoding or gateway transformation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profile", "status", "bodyDigest", "capturePoint"],
+  "properties": {
+    "profile": { "const": "org.peacprotocol.examples.payment-evidence/origin-result-binding/1" },
+    "status": { "type": "integer", "minimum": 100, "maximum": 599 },
+    "contentType": { "type": "string" },
+    "contentEncoding": { "type": "string" },
+    "bodyDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "capturePoint": { "const": "origin_pre_transfer_encoding" }
+  }
+}
