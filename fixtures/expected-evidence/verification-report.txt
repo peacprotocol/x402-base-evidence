@@ -1,0 +1,28 @@
+Evidence verification: fixtures/expected-evidence
+
+  ok    record signature and schema: verified under kid base-payment-evidence-fixture-key-1
+  ok    record type: org.peacprotocol/payment
+  ok    extension groups: org.peacprotocol/commerce, com.example/payment_evidence
+  ok    request binding digest: sha256:cdaf3bfc725a1e66fb583ed6ebc7853aee9330633ca7522d45783756f7ba1843
+  ok    request binding local profile: matches the example-local schema
+  ok    origin result binding digest: sha256:ea22f378381de6decceb275b26126380c04475b92f95d92bca6616a048b6a59c
+  ok    origin result binding local profile: matches the example-local schema
+  ok    chain observation digest: sha256:b4cdeb7788c19b097ab665ea80f89adea35d011f1689cc296eee6ac661e28214
+  ok    payment-required digest: sha256:86b5943e8265096a37c765b2dfa475192b840a63aeee31e048d0df0d62540ca0
+  ok    payment-signature digest: sha256:5f4b92dd1fada6010447099c3f3d3b6d8ed092bc2f3aa6db95d47d7bc22975e5
+  ok    payment-response digest: sha256:bf0b4a490ecb29aa8ba3f924ccb7cb12a6682bac4b346264f7e540310d4fc755
+  ok    origin result body: sha256:5f564269ae83a2ab0cde2d8de9fed2921ffa95e67aa7fa6035884c93bce3087c
+  ok    artifact presence contract: consistent with response_write_attempted
+  ok    chain observation local profile: org.peacprotocol.examples.payment-evidence/base-chain-observation/1
+  ok    chain observation scheme: exact
+  ok    expectation and observation are separately attributed: payment_expectation and chain_observation both present with their sources
+  ok    settlement facts match the outcome: settled, transaction recorded
+  ok    expectation comparison: network=match asset=not_evaluated recipient=not_evaluated amount=not_evaluated authorization=linked transfer_event=not_evaluated
+  ok    record and observation name the same network: eip155:84532
+  ok    record and observation name the same terminal state: response_write_attempted
+  ok    record and observation name the same asset: 0x036CbD53842c5426634e7929541eC2318f3dCF7e
+  ok    record and observation name the same amount: 250000
+  ok    record and observation name the same settlement response digest: sha256:bf0b4a490ecb29aa8ba3f924ccb7cb12a6682bac4b346264f7e540310d4fc755
+  ok    result binding and observation name the same origin result digest: sha256:5f564269ae83a2ab0cde2d8de9fed2921ffa95e67aa7fa6035884c93bce3087c
+
+Verified. Contents are intact relative to the supplied key, every bound digest recomputes, and the checked cross-document fields are internally consistent.

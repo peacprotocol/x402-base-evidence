@@ -1,0 +1,29 @@
+Reproducibility of this directory
+
+Every file here is byte-identical across runs of the offline end-to-end flow.
+
+Inputs that would otherwise vary are pinned, not suppressed:
+  record identifier (jti)   supplied to issuance: 01984000-0000-7000-8000-0000b45e0201
+  occurred-at and observed-at fixed at Unix 1785000000
+  payer, recipient, authorization nonce, signature bytes and transaction reference are
+    the fixed synthetic values from the deterministic fixtures
+  payment identifier        pay_0000000000000000000000000000f1x2
+  issuer key                the clearly labelled test-only key in src/flow/issuer-key.ts
+
+One input is derived from the process clock and cannot be supplied:
+  the issued-at claim (iat). PEAC issuance stamps it from the clock and exposes no option
+  to set it, so the offline run fixes the process clock around the issuance call and
+  restores it immediately afterwards. Nothing in the issuance path is patched or replaced.
+  The signature covers iat, so without this the record bytes, and only the record bytes,
+  would differ between runs.
+
+The listening port is not fixed and does not need to be, because this run binds a fixed
+SYNTHETIC resource identity rather than the address it was served on. That identity
+corresponds to no socket and no deployment; it exists so these bytes reproduce.
+
+A live run binds the opposite: the request components the origin observed, including the
+real authority and port it was serving on. Nothing in this directory describes a live run.
+
+This evidence describes an offline run. No payment occurred, no facilitator or RPC endpoint
+was contacted, the transaction reference is placeholder text, and the comparison verdicts
+record not_evaluated for everything only a chain observer could establish.
