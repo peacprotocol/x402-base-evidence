@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Non-normative validation and binding reference for the x402 v2 exact scheme using the EIP-3009 asset-transfer method on Base.",
+  "description": "Non-normative reference implementation for x402 v2 exact/EIP-3009 payment evidence on Base, including origin binding, settlement observation, signed PEAC evidence, and offline verification.",
   "license": "Apache-2.0",
   "engines": {
     "node": "^22.13.0 || ^24.0.0"

@@ -9,8 +9,8 @@ PEAC record issuance over the resulting digests, and offline verification of tha
 supplied public key, with a deterministic validation corpus and a byte-reproducible offline
 end-to-end fixture.
 
-A live Base Sepolia execution of this flow has not yet been performed from this repository; see
-[§4 Current implementation status](#4-current-implementation-status).
+This revision is validated through the deterministic offline flow and does not include a live Base
+Sepolia execution; see [§4 Current implementation status](#4-current-implementation-status).
 
 Independent open-source reference implementation; not an endorsement or official implementation of
 Base, Coinbase, the x402 Foundation, Circle, or any facilitator.
@@ -50,10 +50,10 @@ between the two repositories, and none is introduced by this note).
 
 ## 2. What this is not
 
-- **Not a live-proven payment flow yet.** The flow is complete and exercised offline against an
-  in-process facilitator and wallet stand-in; no real Base Sepolia transaction has been executed
-  from this repository, and no output of the offline path may be presented as a payment having been
-  made.
+- **Not a live-proven payment flow.** The flow is complete and exercised offline against an
+  in-process facilitator and wallet stand-in; this revision includes no real Base Sepolia
+  transaction executed from this repository, and no output of the offline path may be presented as
+  a payment having been made.
 - **Not an x402 conformance authority.** Validation authority is always named per artifact
   ([§6](#6-validation-and-acceptance-model)); nothing here should be read as an x402 standards body
   or as speaking for the x402 project.
@@ -91,11 +91,12 @@ establishes the integrity of that report; it does not establish blockchain conse
 not make the issuer's account of events authoritative.
 
 Base distinguishes Flashblock preconfirmation, sealed L2 block inclusion, L1 batch inclusion and L1
-finality. The observation layer here records **sealed L2 block inclusion only**, and only after
-comparing the transaction's reported block number and hash against sealed block data queried by
-explicit block number: for Base's documented public HTTP JSON-RPC the caller's block tag selects
-the confirmation semantics, so the canonical observation never uses the `pending` tag, and sealed
-inclusion is never inferred from the mere existence of a transaction receipt. `receipt_status` is
+finality. The observation layer here records **sealed L2 block inclusion only**, and only after the
+receipt's reported block placement, the transaction object's reported block placement and sealed
+block data queried by explicit block number all agree — including that the sealed block's own
+transaction list contains the transaction: for Base's documented public HTTP JSON-RPC the caller's
+block tag selects the confirmation semantics, so the canonical observation never uses the `pending`
+tag, and sealed inclusion is never inferred from the mere existence of a transaction receipt. `receipt_status` is
 the EVM execution result and nothing else — not an inclusion level, not finality, and not by itself
 evidence that the expected payment occurred; matching-payment evidence additionally requires the
 expected token, from, to and value transfer event plus native x402 validation. L1 batch inclusion
@@ -117,7 +118,7 @@ disagreement, not resolved into either side being authoritative.
 | end-to-end payment flow | implemented; exercised offline against an in-process facilitator |
 | PEAC signed record issuance and offline verification | implemented |
 | settlement observation layer (sealed-L2 contract) | implemented; exercised against synthetic sealed sources |
-| live Base Sepolia execution and live settlement observation | not yet performed from this repository |
+| live Base Sepolia execution and live settlement observation | outside this revision; the flow is validated offline |
 | x402 signed offers and receipts | preserved when present inside captured field values; not enabled in the deterministic fixture (see [§9](#9-relationship-to-peac-x402-and-base)) |
 | scheme `upto` | out of scope |
 | batch settlement | out of scope |
@@ -174,10 +175,14 @@ directory states exactly which inputs are pinned to achieve that, and that no pa
 
 Fixtures are synthetic. The network is Base Sepolia (`eip155:84532`, declared as an explicit local
 constant) and the asset is the public Base Sepolia USDC contract, taken from the upstream package's
-own default-asset registry. Every payer, recipient,
-authorization nonce, transaction hash and signature value is a deterministic synthetic placeholder
-derived from a descriptive label via SHA-256; this repository generates and possesses no private key
-for any of them and does not use them for onchain execution.
+own default-asset registry. Every payer, recipient, authorization nonce, transaction hash and
+signature value in the deterministic fixtures is a synthetic placeholder derived from a descriptive
+label via SHA-256; no private key for those account addresses is derived or held here, and they are
+not used for onchain execution. The keys this repository does contain are explicitly labelled
+TEST-ONLY fixture keys — the fixture issuer key that signs the committed record, and deterministic
+EVM test keys used so the installed upstream signature validation runs over real signatures. They
+are permanently public, never funded, never reused outside these fixtures, and never credentials or
+trust anchors; see [`SECURITY.md`](SECURITY.md).
 
 ## 6. Validation and acceptance model
 
@@ -367,12 +372,17 @@ evidence path, and nothing signed or persisted is ever produced by the independe
 
 ## 8. Security
 
-See [`SECURITY.md`](SECURITY.md) for the full policy. In summary: no private keys, seed phrases or
-signed payment authorizations belong in this repository, its history, its fixtures, its logs, or a
-recorded demonstration; every fixture value is a deterministic synthetic placeholder with no
-corresponding private key held anywhere in this repository; continuous integration runs a
-full-history secret scan with a self-proving canary; validator diagnostics are bounded and never
-retain attacker-controlled message text (see [§6](#6-validation-and-acceptance-model)).
+See [`SECURITY.md`](SECURITY.md) for the full policy. In summary: no live, funded, production or
+reusable secret private keys, no wallet credentials or seed phrases, and no real payment
+authorizations belong in this repository, its history, its logs, or a recorded demonstration. What
+the repository deliberately does contain are explicitly labelled TEST-ONLY fixture keys and the
+synthetic signed fixture artifacts they produce (including the committed record) — permanently
+public test vectors that must never be funded, reused, or treated as credentials or trust anchors.
+Fixture account values are label-derived placeholders with no private key derived or held here.
+Live-mode keys stay gitignored under `.local/` with restrictive permissions and are never printed.
+Continuous integration runs a full-history secret scan with a self-proving canary; validator
+diagnostics are bounded and never retain attacker-controlled message text (see
+[§6](#6-validation-and-acceptance-model)).
 
 ## 9. Relationship to PEAC, x402 and Base
 
@@ -446,8 +456,10 @@ advertised in the type or the schema.
 ## Privacy
 
 Payment signatures, payer identifiers, receipts and transaction references can be sensitive. Public
-evidence is digest-only by default; raw artifacts stay private outside fixture mode. No private key
-or payment authorization belongs in this repository, its logs, or a recorded demonstration.
+evidence is digest-only by default; raw artifacts stay private outside fixture mode. No live or
+reusable secret private key and no real payment authorization belongs in this repository, its logs,
+or a recorded demonstration; the labelled test-only fixture keys and synthetic signed fixtures are
+public test vectors ([`SECURITY.md`](SECURITY.md)).
 
 ## License
 

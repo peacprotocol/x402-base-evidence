@@ -7,21 +7,47 @@ published. Do not open public issues for vulnerabilities.
 
 ## Key and payment material
 
-This repository must never contain private keys, payment authorizations, or funded-wallet material.
+Two classes of key material exist here, and this policy distinguishes them rather than claiming
+the repository holds none.
 
-- **No private keys, seed phrases or signed payment authorizations** in the repository, in its
-  history, in test fixtures, in logs, or in a recorded demonstration. Every account and
-  authorization value in the fixtures is a deterministic synthetic placeholder derived from a
-  descriptive label. This repository generates and possesses no private key for any of them and does
-  not use them for onchain execution; it makes no claim that no account with a matching address could
-  ever exist on any network, which it has no way to verify.
-- **Keys used by any live mode stay outside version control**, under an ignored local
-  directory, with restrictive file permissions. They are never regenerated per run and never
-  printed; only the corresponding public address is ever displayed.
-- **Base Sepolia only.** Any live mode targets a development network with valueless test assets.
-  Mainnet execution, mainnet funds and real credentials are outside the scope of this reference
-  implementation.
-- A secret scan runs over the full history in continuous integration.
+**Prohibited — never in this repository, its history, its logs, or a recorded demonstration:**
+
+- live, funded, production or reusable secret private keys;
+- wallet credentials and seed phrases;
+- real payment authorizations;
+- private key material copied into evidence artifacts;
+- private key material printed, logged or recorded, in any mode.
+
+**Permitted — deliberately present, as public test vectors:**
+
+- deterministic, explicitly labelled TEST-ONLY fixture keys in fixture and test code, where
+  cryptographic behavior genuinely needs a real signature: the fixture issuer signing key in
+  `src/flow/issuer-key.ts` (`FIXTURE_ISSUER_PRIVATE_KEY`), which signs the committed fixture
+  record, and the deterministic EVM test keys in `src/test-evm-matrix.ts`, used in-process so the
+  installed upstream EIP-712/EIP-3009 validation logic runs over real signatures;
+- the synthetic signed fixture artifacts those keys and the labelled placeholder values produce,
+  including the committed `fixtures/expected-evidence/record.jws` and the captured payment field
+  values. They are public verification material, and verifying them is the point of committing
+  them.
+
+Test-only fixture keys are permanently public and permanently compromised. They MUST NEVER be
+funded; MUST NEVER be reused outside these fixtures; MUST NEVER be treated as credentials or trust
+anchors; and their addresses MUST NOT be treated as controlled production identities.
+
+- **Fixture account values are placeholders.** Every payer, recipient and authorization value in
+  the deterministic fixtures is a synthetic placeholder derived from a descriptive label; no
+  private key for those account addresses is derived or held here, they are not used for onchain
+  execution, and no claim is made that no account with a matching address could ever exist on any
+  network, which this repository has no way to verify.
+- **Keys used by any live mode stay outside version control**, gitignored under `.local/`, with
+  restrictive file permissions, created only when no key file exists (an existing file is refused,
+  never replaced), and never printed; only the corresponding public address is ever displayed.
+- **Base Sepolia only.** Any live mode targets a development network with Base Sepolia test
+  assets. Mainnet execution, mainnet funds and real credentials are outside the scope of this
+  reference implementation.
+- A secret scan runs over the full history in continuous integration, with a self-proving canary.
+  Its one allowlist entry is scoped to the committed fixture record and the jwt rule only, so a
+  real token anywhere else in the repository is still a finding.
 
 ## Handling observed payment artifacts
 
@@ -59,7 +85,9 @@ It still does not establish:
 Base distinguishes Flashblock preconfirmation, sealed L2 block inclusion, L1 batch inclusion and L1
 finality. The observation layer in this repository records sealed L2 block inclusion only, with the
 named source and the observation level actually established: the canonical observation never uses
-the `pending` block tag, sealed inclusion is recorded only after the reported block number and hash
-agree with sealed block data queried by explicit block number, and it is never inferred from the
-mere existence of a transaction receipt. An EVM receipt's execution status is not a finality claim,
-and L1 batch inclusion and L1 finality are never claimed unless separately observed.
+the `pending` block tag, sealed inclusion is recorded only after the receipt's reported placement,
+the transaction object's reported placement and sealed block data queried by explicit block number
+all agree — including that the sealed block's own transaction list contains the transaction — and
+it is never inferred from the mere existence of a transaction receipt. An EVM receipt's execution
+status is not a finality claim, and L1 batch inclusion and L1 finality are never claimed unless
+separately observed.
