@@ -92,12 +92,21 @@ function checkTerms(
   return undefined;
 }
 
-/** The authorization nonce, which is what one EIP-3009 authorization is identified by. */
-function authorizationNonce(payload: PaymentPayload): string | undefined {
+/**
+ * The pair one EIP-3009 authorization is identified by: the authorizer together with its 32-byte
+ * nonce. EIP-3009 keys authorization state as `authorizationState(address authorizer, bytes32
+ * nonce)`, so the same nonce under a different authorizer names a different authorization, and a
+ * nonce alone identifies nothing. Both halves are hex values and are lower-cased before keying,
+ * so case variants of one authorization cannot read as distinct authorizations.
+ */
+function authorizationIdentity(payload: PaymentPayload): string | undefined {
   const authorization = payload.payload['authorization'];
   if (typeof authorization !== 'object' || authorization === null) return undefined;
-  const nonce = (authorization as Record<string, unknown>)['nonce'];
-  return typeof nonce === 'string' ? nonce : undefined;
+  const record = authorization as Record<string, unknown>;
+  const from = record['from'];
+  const nonce = record['nonce'];
+  if (typeof from !== 'string' || typeof nonce !== 'string') return undefined;
+  return `${from.toLowerCase()}:${nonce.toLowerCase()}`;
 }
 
 /**
@@ -111,15 +120,18 @@ class FixtureExactEvmFacilitator implements SchemeNetworkFacilitator {
   readonly caipFamily = 'eip155:*';
 
   /**
-   * Authorization nonces this instance has already settled.
+   * Authorizer-and-nonce pairs this instance has already settled.
    *
-   * On the network, a consumed EIP-3009 authorization cannot produce a second transfer. This set
-   * is the offline stand-in for that consumed state, so the repeated-settlement branch of the
-   * lifecycle is reachable without a chain; it belongs to one facilitator instance, dedupes within
-   * a run, and never carries state between runs. It is a stand-in and is recorded as one: no
-   * output derived from it names the mechanism a real facilitator or the network enforces.
+   * On the network, a consumed EIP-3009 authorization cannot produce a second transfer, and the
+   * consumed state is keyed by the pair `(authorizer, nonce)` — never by the nonce alone, since
+   * two authorizers may independently use the same nonce value. This set models that
+   * authorizer-scoped fixture consumption so the repeated-settlement branch of the lifecycle is
+   * reachable without a chain; it belongs to one facilitator instance, dedupes within a run, and
+   * never carries state between runs. It is a stand-in and is recorded as one: it does not claim
+   * to prove the network's replay mechanism, and no output derived from it names the mechanism a
+   * real facilitator or the network enforces.
    */
-  private readonly settledNonces = new Set<string>();
+  private readonly settledAuthorizations = new Set<string>();
 
   private readonly behavior: FixtureFacilitatorBehavior;
   private readonly calls: FixtureFacilitatorCalls;
@@ -156,9 +168,9 @@ class FixtureExactEvmFacilitator implements SchemeNetworkFacilitator {
     requirements: PaymentRequirements,
   ): Promise<SettleResponse> {
     this.calls.settle++;
-    const nonce = authorizationNonce(payload);
-    if (nonce !== undefined) {
-      if (this.settledNonces.has(nonce)) {
+    const identity = authorizationIdentity(payload);
+    if (identity !== undefined) {
+      if (this.settledAuthorizations.has(identity)) {
         return {
           success: false,
           errorReason: DUPLICATE_SETTLEMENT_REASON,
@@ -169,7 +181,7 @@ class FixtureExactEvmFacilitator implements SchemeNetworkFacilitator {
       }
       // Consumed before the first await, so two settlements of one authorization cannot interleave
       // past the check.
-      this.settledNonces.add(nonce);
+      this.settledAuthorizations.add(identity);
     }
     if (this.behavior.throwOnSettle !== undefined) throw new Error(this.behavior.throwOnSettle);
     if (this.behavior.rejectSettlement !== undefined) {

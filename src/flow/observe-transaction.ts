@@ -13,9 +13,10 @@
  * mere existence of a transaction receipt: Base's own documentation is in conflict over whether
  * receipts are returned for transactions that are only in a Flashblock, so receipt existence is an
  * unresolved signal and carries no inclusion claim here. Sealed inclusion is recorded only after
- * the transaction's reported block number and block hash are compared against sealed block data
- * queried by explicit block number, and only when the two agree does the observation carry
- * `observation_level: "l2_block_inclusion"`.
+ * the receipt's reported block placement, the transaction object's reported block placement, and
+ * sealed block data queried by explicit block number all agree — including that the sealed
+ * block's own transaction list contains this transaction hash — and only then does the
+ * observation carry `observation_level: "l2_block_inclusion"`.
  *
  * `receipt_status` is the EVM execution result, success or revert, and nothing else: not an
  * inclusion level, not finality, and not by itself evidence that the expected payment occurred.
@@ -54,12 +55,21 @@ export interface ObservedReceipt {
 export interface ObservedTransaction {
   /** The account that broadcast the transaction. An observed fact, never an inferred role. */
   readonly from: string;
+  /** Block placement as reported by the transaction object. Null when the endpoint reported none. */
+  readonly blockNumber: bigint | null;
+  readonly blockHash: string | null;
 }
 
 /** One sealed block, queried by explicit block number. */
 export interface SealedBlock {
   readonly number: bigint;
   readonly hash: string;
+  /**
+   * Every transaction hash the sealed block reports containing. Retained because a block that
+   * carries the expected number and hash still says nothing about whether it contains a given
+   * transaction; membership in this list is part of what an inclusion claim must establish.
+   */
+  readonly transactionHashes: readonly string[];
 }
 
 export interface SealedTransactionSource {
@@ -140,38 +150,57 @@ export const TRANSFER_EVENT_TOPIC =
 /** A 0x-prefixed sequence of hex digits, the only shape a hex quantity or address arrives in. */
 const HEX_VALUE = /^0x[0-9a-fA-F]*$/;
 
+/** Exactly one 20-byte hex address. */
+const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+
+/**
+ * A 32-byte ABI word holding an indexed address: 12 zero bytes of padding, then the 20 address
+ * bytes. Solidity's ABI event encoding zero-pads an indexed `address` on the left, so a topic
+ * whose high 12 bytes are not zero is not a well-formed address topic and is never truncated
+ * into one.
+ */
+const ADDRESS_TOPIC = /^0x0{24}[0-9a-fA-F]{40}$/;
+
+/** Exactly one 32-byte ABI word, the encoding of a non-indexed `uint256`. */
+const ABI_WORD = /^0x[0-9a-fA-F]{64}$/;
+
 /**
  * Read the ERC-20 transfers on one token contract out of raw receipt logs.
  *
- * STRUCTURAL ONLY. This decodes the standard Transfer event layout: the signature topic, two
- * indexed address topics padded to 32 bytes, and the amount as the data word. It interprets
- * nothing else and validates nothing about the token, and a log that does not match the layout
- * exactly is skipped rather than guessed at.
+ * STRUCTURAL ONLY. This is local ABI structure parsing, not a token-validity or payment oracle:
+ * it decodes the standard Transfer event layout — the signature topic, two indexed address topics
+ * each zero-padded to 32 bytes, and the amount as exactly one ABI data word — and nothing else.
+ * Each structural rule is checked before anything is decoded, and a log that does not match the
+ * layout exactly is skipped rather than guessed at: a topic with non-zero padding bytes is never
+ * sliced down to an address, and data that is not exactly one word is never read as an amount.
  */
 export function transfersOnContract(
   logs: readonly ObservedLog[],
   tokenContract: string,
 ): ObservedTokenTransfer[] {
   const transfers: ObservedTokenTransfer[] = [];
+  if (!HEX_ADDRESS.test(tokenContract)) return transfers;
   const contract = tokenContract.toLowerCase();
   for (const log of logs) {
-    if (typeof log.address !== 'string' || log.address.toLowerCase() !== contract) continue;
-    if (log.topics.length !== 3 || log.topics[0] !== TRANSFER_EVENT_TOPIC) continue;
-    const [, fromTopic, toTopic] = log.topics;
+    if (typeof log.address !== 'string' || !HEX_ADDRESS.test(log.address)) continue;
+    if (log.address.toLowerCase() !== contract) continue;
+    if (log.topics.length !== 3) continue;
+    const [signatureTopic, fromTopic, toTopic] = log.topics;
     if (
-      fromTopic === undefined ||
-      toTopic === undefined ||
-      !/^0x[0-9a-fA-F]{64}$/.test(fromTopic) ||
-      !/^0x[0-9a-fA-F]{64}$/.test(toTopic) ||
-      !HEX_VALUE.test(log.data)
+      signatureTopic === undefined ||
+      !ABI_WORD.test(signatureTopic) ||
+      signatureTopic.toLowerCase() !== TRANSFER_EVENT_TOPIC
     ) {
       continue;
     }
+    if (fromTopic === undefined || toTopic === undefined) continue;
+    if (!ADDRESS_TOPIC.test(fromTopic) || !ADDRESS_TOPIC.test(toTopic)) continue;
+    if (!ABI_WORD.test(log.data)) continue;
     transfers.push({
       token_contract: log.address,
       transfer_from: `0x${fromTopic.slice(-40)}`,
       transfer_to: `0x${toTopic.slice(-40)}`,
-      transfer_amount: BigInt(log.data === '0x' ? '0x0' : log.data).toString(10),
+      transfer_amount: BigInt(log.data).toString(10),
     });
   }
   return transfers;
@@ -218,11 +247,12 @@ function isoOf(observedAtUnixSeconds: number): string {
  * Observe one transaction through a sealed transaction source.
  *
  * This is the sealed-L2 observation sequence, in full: query the receipt and the transaction,
- * treat receipt existence as an observed fact and nothing more, query sealed block data by the
- * explicit block number the receipt reported, compare the reported number and hash against that
- * sealed data, and record `l2_block_inclusion` only when they agree. `receipt_status` is recorded
- * separately as the execution result. No step uses preconfirmation state, and no step claims L1
- * batch inclusion or L1 finality.
+ * treat their existence as observed facts and nothing more, query sealed block data by the
+ * explicit block number the receipt reported, and record `l2_block_inclusion` only when the
+ * receipt's placement, the transaction object's placement and the sealed block data all agree —
+ * number, hash, and the sealed block's transaction list containing this transaction hash.
+ * `receipt_status` is recorded separately as the execution result. No step uses preconfirmation
+ * state, and no step claims L1 batch inclusion or L1 finality.
  *
  * Never throws: an observation that could not be made is a result, not a failure of the run.
  */
@@ -288,36 +318,59 @@ export async function observeSealedTransaction(input: {
   const matching = transfers.find((t) => transferMatchesExpected(t, expectedTransfer));
   const recordedTransfer = matching ?? transfers[0];
 
-  // Sealed-block comparison. A receipt without block placement, or a sealed-block query that does
-  // not answer or does not agree, leaves the observation without an inclusion level: the receipt's
-  // existence has already been recorded above and is not promoted into a claim it cannot carry.
+  // Sealed-block comparison. Inclusion is recorded only when every placement fact agrees: the
+  // receipt reports a block, the transaction object exists and reports the same block, sealed
+  // block data queried by that explicit number carries the same number and hash, the sealed
+  // block's own transaction list contains this transaction hash, and the block is at or below
+  // the sealed head. Anything missing or disagreeing leaves the observation without an inclusion
+  // level: the receipt and transaction stay recorded as observed facts and are not promoted into
+  // a claim they cannot carry. A failed comparison is a factual gap in what could be observed —
+  // never a signature failure — and no finality claim is derived from any branch of it.
   let inclusion: { block_number: string; block_hash: string } | undefined;
   let inclusionNote = 'sealed inclusion was not established';
-  if (receipt.blockNumber !== null && receipt.blockHash !== null) {
+  if (receipt.blockNumber === null || receipt.blockHash === null) {
+    inclusionNote = 'the receipt reported no block placement, so no inclusion level is recorded';
+  } else if (
+    transaction === undefined ||
+    transaction.blockNumber === null ||
+    transaction.blockHash === null
+  ) {
+    inclusionNote =
+      'the transaction object reported no block placement, so no inclusion level is recorded';
+  } else if (
+    transaction.blockNumber !== receipt.blockNumber ||
+    transaction.blockHash.toLowerCase() !== receipt.blockHash.toLowerCase()
+  ) {
+    inclusionNote =
+      'the transaction object and the receipt disagree on block placement, so no inclusion ' +
+      'level is recorded';
+  } else {
     try {
       const sealedBlock = await source.sealedBlockByNumber(receipt.blockNumber);
       const head = await source.sealedHeadBlockNumber();
+      const wanted = transactionHash.toLowerCase();
       if (
         sealedBlock !== undefined &&
         sealedBlock.number === receipt.blockNumber &&
         sealedBlock.hash.toLowerCase() === receipt.blockHash.toLowerCase() &&
+        sealedBlock.transactionHashes.some((hash) => hash.toLowerCase() === wanted) &&
         receipt.blockNumber <= head
       ) {
         inclusion = {
           block_number: receipt.blockNumber.toString(10),
           block_hash: receipt.blockHash,
         };
-        inclusionNote = `sealed block ${inclusion.block_number} agreed with the reported placement`;
+        inclusionNote =
+          `sealed block ${inclusion.block_number} agreed with the reported placement and ` +
+          'lists this transaction';
       } else {
         inclusionNote =
-          'the sealed block data queried by explicit number did not agree with the placement ' +
-          'the receipt reported';
+          'the sealed block data queried by explicit number did not agree with the reported ' +
+          'placement or did not list this transaction, so no inclusion level is recorded';
       }
     } catch {
       inclusionNote = 'sealed block data could not be queried, so no inclusion level is recorded';
     }
-  } else {
-    inclusionNote = 'the receipt reported no block placement, so no inclusion level is recorded';
   }
 
   const transferNote =
@@ -455,10 +508,18 @@ export function baseSealedRpcSource(rpcUrl: string, timeoutMs = 10_000): SealedT
     async transactionByHash(transactionHash: string): Promise<ObservedTransaction | undefined> {
       const result = await rpcCall(rpcUrl, 'eth_getTransactionByHash', [transactionHash], timeoutMs);
       if (result === null || result === undefined) return undefined;
-      const transaction = result as { from?: unknown };
-      return typeof transaction.from === 'string' ? { from: transaction.from } : undefined;
+      const transaction = result as { from?: unknown; blockNumber?: unknown; blockHash?: unknown };
+      if (typeof transaction.from !== 'string') return undefined;
+      return {
+        from: transaction.from,
+        blockNumber: hexQuantity(transaction.blockNumber),
+        blockHash: typeof transaction.blockHash === 'string' ? transaction.blockHash : null,
+      };
     },
     async sealedBlockByNumber(blockNumber: bigint): Promise<SealedBlock | undefined> {
+      // Asked with `false`, so `transactions` is the list of transaction hashes. That list is
+      // parsed and retained because sealed inclusion requires the sealed block to actually
+      // contain the transaction, not merely to carry the number and hash the receipt reported.
       const result = await rpcCall(
         rpcUrl,
         'eth_getBlockByNumber',
@@ -466,10 +527,15 @@ export function baseSealedRpcSource(rpcUrl: string, timeoutMs = 10_000): SealedT
         timeoutMs,
       );
       if (result === null || result === undefined) return undefined;
-      const block = result as { number?: unknown; hash?: unknown };
+      const block = result as { number?: unknown; hash?: unknown; transactions?: unknown };
       const number = hexQuantity(block.number);
       if (number === null || typeof block.hash !== 'string') return undefined;
-      return { number, hash: block.hash };
+      if (!Array.isArray(block.transactions)) return undefined;
+      const transactionHashes: string[] = [];
+      for (const entry of block.transactions) {
+        if (typeof entry === 'string') transactionHashes.push(entry);
+      }
+      return { number, hash: block.hash, transactionHashes };
     },
   };
 }

@@ -70,6 +70,7 @@ import { compareExpectationToObservation } from './flow/observe-settlement.ts';
 import {
   observeSealedTransaction,
   TRANSFER_EVENT_TOPIC,
+  transfersOnContract,
   type ObservedLog,
   type SealedTransactionSource,
 } from './flow/observe-transaction.ts';
@@ -512,8 +513,16 @@ const passed = (report: EvidenceVerificationReport, name: string): boolean =>
       blockHash: '0x'.padEnd(66, 'a'),
       logs: [matchingLog],
     }),
-    transactionByHash: async () => ({ from: broadcaster }),
-    sealedBlockByNumber: async (n) => ({ number: n, hash: '0x'.padEnd(66, 'a') }),
+    transactionByHash: async () => ({
+      from: broadcaster,
+      blockNumber: 900n,
+      blockHash: '0x'.padEnd(66, 'a'),
+    }),
+    sealedBlockByNumber: async (n) => ({
+      number: n,
+      hash: '0x'.padEnd(66, 'a'),
+      transactionHashes: [F.SETTLEMENT_TX_HASH],
+    }),
   };
   const observation = await observeSealedTransaction({
     source,
@@ -624,6 +633,48 @@ recordExecution('EVM-REPLAY-001');
   }
 }
 
+// Completes EVM-REPLAY-001: consumed-authorization state is scoped to the pair
+// (authorizer, nonce), the way EIP-3009 keys `authorizationState(address authorizer, bytes32
+// nonce)`. The same authorizer repeating a nonce is a duplicate — under any hex casing — while a
+// different authorizer using the same nonce value is a different authorization and must not
+// collide with it.
+{
+  const withAuthorizer = (from: string): PaymentPayload =>
+    structuredClone({
+      ...F.PAYMENT_PAYLOAD,
+      payload: {
+        ...F.PAYMENT_PAYLOAD.payload,
+        authorization: { ...F.EXACT_EVM_AUTHORIZATION, from },
+      },
+    });
+  const otherAuthorizer = '0x00000000000000000000000000000000000000aa';
+  const scoped = createFixtureFacilitator(F.NETWORK);
+  const first = await scoped.client.settle(withAuthorizer(F.PAYER), F.PAYMENT_REQUIREMENTS);
+  const repeated = await scoped.client.settle(
+    withAuthorizer(`0x${F.PAYER.slice(2).toUpperCase()}`),
+    F.PAYMENT_REQUIREMENTS,
+  );
+  const differentAuthorizer = await scoped.client.settle(
+    withAuthorizer(otherAuthorizer),
+    F.PAYMENT_REQUIREMENTS,
+  );
+  check(
+    'the first settlement of an authorizer-and-nonce pair succeeds',
+    first.success === true,
+    JSON.stringify(first),
+  );
+  check(
+    'the same authorizer repeating the same nonce is refused as a duplicate, across hex casing',
+    repeated.success === false && repeated.errorReason === DUPLICATE_SETTLEMENT_REASON,
+    JSON.stringify(repeated),
+  );
+  check(
+    'a different authorizer using the same nonce value does not collide with the consumed pair',
+    differentAuthorizer.success === true,
+    JSON.stringify(differentAuthorizer),
+  );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Evidence: a receipt is not a payment.
 // ---------------------------------------------------------------------------------------------
@@ -654,8 +705,16 @@ recordExecution('EVM-EVIDENCE-001');
       blockHash: '0x'.padEnd(66, 'b'),
       logs,
     }),
-    transactionByHash: async () => ({ from: F.PAYER }),
-    sealedBlockByNumber: async (n) => ({ number: n, hash: '0x'.padEnd(66, 'b') }),
+    transactionByHash: async () => ({
+      from: F.PAYER,
+      blockNumber: 900n,
+      blockHash: '0x'.padEnd(66, 'b'),
+    }),
+    sealedBlockByNumber: async (n) => ({
+      number: n,
+      hash: '0x'.padEnd(66, 'b'),
+      transactionHashes: [F.SETTLEMENT_TX_HASH],
+    }),
   });
   const expectationSide = {
     payment_expectation: {
@@ -724,7 +783,11 @@ recordExecution('EVM-EVIDENCE-001');
   // inclusion level. Receipt existence never carries the claim.
   const disagreeing: SealedTransactionSource = {
     ...sourceWith([]),
-    sealedBlockByNumber: async (n) => ({ number: n, hash: '0x'.padEnd(66, 'c') }),
+    sealedBlockByNumber: async (n) => ({
+      number: n,
+      hash: '0x'.padEnd(66, 'c'),
+      transactionHashes: [F.SETTLEMENT_TX_HASH],
+    }),
   };
   const noInclusion = await observeSealedTransaction({
     source: disagreeing,
@@ -756,6 +819,178 @@ recordExecution('EVM-EVIDENCE-001');
     stillNoInclusion.observation_state === 'found' &&
       stillNoInclusion.observation_level === undefined,
     `level ${String(stillNoInclusion.observation_level)}`,
+  );
+
+  // The strengthened inclusion sequence: every placement fact must agree, including the sealed
+  // block's own transaction list containing the transaction. Each vector below breaks exactly one
+  // agreement and asserts that the observation keeps its observed facts while carrying no
+  // inclusion level.
+  check(
+    'when every placement fact agrees, and only then, sealed inclusion is recorded',
+    bare.observation_level === 'l2_block_inclusion' && bare.receipt_status === 'success',
+    `level ${String(bare.observation_level)}`,
+  );
+
+  const txAbsentFromSealedList: SealedTransactionSource = {
+    ...sourceWith([]),
+    sealedBlockByNumber: async (n) => ({
+      number: n,
+      hash: '0x'.padEnd(66, 'b'),
+      transactionHashes: ['0x'.padEnd(66, '9')],
+    }),
+  };
+  const absentFromList = await observeSealedTransaction({
+    source: txAbsentFromSealedList,
+    transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedTransfer,
+    observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
+  });
+  check(
+    'a sealed block that agrees on number and hash but does not list the transaction records no inclusion',
+    absentFromList.observation_state === 'found' &&
+      absentFromList.observation_level === undefined &&
+      absentFromList.receipt_status === 'success',
+    `level ${String(absentFromList.observation_level)}`,
+  );
+
+  const txHashDisagrees: SealedTransactionSource = {
+    ...sourceWith([]),
+    transactionByHash: async () => ({
+      from: F.PAYER,
+      blockNumber: 900n,
+      blockHash: '0x'.padEnd(66, 'd'),
+    }),
+  };
+  const hashDisagreement = await observeSealedTransaction({
+    source: txHashDisagrees,
+    transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedTransfer,
+    observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
+  });
+  check(
+    'a receipt-versus-transaction block hash disagreement records no inclusion',
+    hashDisagreement.observation_state === 'found' &&
+      hashDisagreement.observation_level === undefined &&
+      hashDisagreement.receipt_status === 'success',
+    `level ${String(hashDisagreement.observation_level)}`,
+  );
+
+  const txNumberDisagrees: SealedTransactionSource = {
+    ...sourceWith([]),
+    transactionByHash: async () => ({
+      from: F.PAYER,
+      blockNumber: 901n,
+      blockHash: '0x'.padEnd(66, 'b'),
+    }),
+  };
+  const numberDisagreement = await observeSealedTransaction({
+    source: txNumberDisagrees,
+    transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedTransfer,
+    observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
+  });
+  check(
+    'a receipt-versus-transaction block number disagreement records no inclusion',
+    numberDisagreement.observation_state === 'found' &&
+      numberDisagreement.observation_level === undefined,
+    `level ${String(numberDisagreement.observation_level)}`,
+  );
+
+  const txWithoutPlacement: SealedTransactionSource = {
+    ...sourceWith([]),
+    transactionByHash: async () => ({ from: F.PAYER, blockNumber: null, blockHash: null }),
+  };
+  const missingPlacement = await observeSealedTransaction({
+    source: txWithoutPlacement,
+    transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedTransfer,
+    observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
+  });
+  check(
+    'a transaction object without block placement records no inclusion',
+    missingPlacement.observation_state === 'found' &&
+      missingPlacement.observation_level === undefined &&
+      missingPlacement.receipt_status === 'success',
+    `level ${String(missingPlacement.observation_level)}`,
+  );
+}
+
+// Exact ERC-20 Transfer decoding. Completes EVM-EVIDENCE-001: the structural parser accepts the
+// canonical event layout exactly — a well-formed token contract address, the Transfer signature
+// topic compared case-insensitively, indexed address topics whose high 12 bytes are zero, and an
+// amount of exactly one ABI word — and skips, never truncates or guesses at, anything else.
+{
+  const pad64 = (address: string): string => `0x${address.slice(2).padStart(64, '0')}`;
+  const oneWord = (value: bigint): string => `0x${value.toString(16).padStart(64, '0')}`;
+  const validLog: ObservedLog = {
+    address: F.ASSET_CONTRACT,
+    topics: [TRANSFER_EVENT_TOPIC, pad64(F.PAYER), pad64(F.PAY_TO)],
+    data: oneWord(BigInt(F.AMOUNT_BASE_UNITS)),
+  };
+
+  const recognized = transfersOnContract([validLog], F.ASSET_CONTRACT);
+  check(
+    'a canonical Transfer event is recognized with its exact addresses and amount',
+    recognized.length === 1 &&
+      recognized[0]?.transfer_from === F.PAYER &&
+      recognized[0]?.transfer_to === F.PAY_TO &&
+      recognized[0]?.transfer_amount === F.AMOUNT_BASE_UNITS,
+    JSON.stringify(recognized),
+  );
+
+  const upperHexTopic = `0x${TRANSFER_EVENT_TOPIC.slice(2).toUpperCase()}`;
+  const upperTopic0 = transfersOnContract(
+    [{ ...validLog, topics: [upperHexTopic, pad64(F.PAYER), pad64(F.PAY_TO)] }],
+    F.ASSET_CONTRACT,
+  );
+  check(
+    'an upper-hex Transfer signature topic is recognized (case-insensitive comparison)',
+    upperTopic0.length === 1,
+    JSON.stringify(upperTopic0),
+  );
+
+  const paddedFrom = `0x${'11'.repeat(12)}${F.PAYER.slice(2)}`;
+  const dirtyFromTopic = transfersOnContract(
+    [{ ...validLog, topics: [TRANSFER_EVENT_TOPIC, paddedFrom, pad64(F.PAY_TO)] }],
+    F.ASSET_CONTRACT,
+  );
+  check(
+    'a from topic with non-zero high padding bytes is ignored, never sliced to an address',
+    dirtyFromTopic.length === 0,
+    JSON.stringify(dirtyFromTopic),
+  );
+
+  const paddedTo = `0x${'11'.repeat(12)}${F.PAY_TO.slice(2)}`;
+  const dirtyToTopic = transfersOnContract(
+    [{ ...validLog, topics: [TRANSFER_EVENT_TOPIC, pad64(F.PAYER), paddedTo] }],
+    F.ASSET_CONTRACT,
+  );
+  check(
+    'a to topic with non-zero high padding bytes is ignored, never sliced to an address',
+    dirtyToTopic.length === 0,
+    JSON.stringify(dirtyToTopic),
+  );
+
+  check(
+    'short uint256 data is ignored: the amount must be exactly one ABI word',
+    transfersOnContract([{ ...validLog, data: '0x1' }], F.ASSET_CONTRACT).length === 0 &&
+      transfersOnContract([{ ...validLog, data: '0x' }], F.ASSET_CONTRACT).length === 0,
+  );
+
+  check(
+    'oversized data is ignored: a second ABI word is not a uint256 amount',
+    transfersOnContract(
+      [{ ...validLog, data: oneWord(BigInt(F.AMOUNT_BASE_UNITS)) + '0'.repeat(64) }],
+      F.ASSET_CONTRACT,
+    ).length === 0,
+  );
+
+  check(
+    'a malformed token contract address yields no accepted transfer',
+    transfersOnContract([validLog], F.ASSET_CONTRACT.slice(0, 41)).length === 0 &&
+      transfersOnContract([validLog], `${F.ASSET_CONTRACT.slice(2)}`).length === 0 &&
+      transfersOnContract([{ ...validLog, address: pad64(F.ASSET_CONTRACT) }], F.ASSET_CONTRACT)
+        .length === 0,
   );
 }
 
