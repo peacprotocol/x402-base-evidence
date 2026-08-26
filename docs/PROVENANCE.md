@@ -28,10 +28,24 @@ Source repository for everything ported: `peacprotocol/x402-solana-evidence`, ta
 | `fixtures/deterministic.ts` | analogous file exists at the same path | reimplemented | Same "deterministic, SHA-256-derived synthetic placeholder" discipline; concrete values are Base Sepolia / EVM, not SVM. |
 | `src/gen-golden.ts`, `src/test-golden.ts`, `src/test-negative.ts`, `src/test-acceptance.ts`, `src/imports-smoke.ts`, `src/fixture-demo.ts` | analogous files exist at the same paths | pattern reused, contents reauthored | Same test-file shape and philosophy; assertions and fixture data are specific to this repository's EVM artifacts. |
 
-**Not ported / no analog in this repository:** `src/flow/` (the Solana observation layer) and the
-Solana-specific test files (`test-evidence.ts`, `test-keys.ts`, `test-preflight.ts`,
-`test-svm-matrix.ts`, `test-verifier-inputs.ts`). Base chain observation, live payment execution,
-and PEAC evidence issuance are not implemented in this repository.
+### Flow layer (`src/flow/`)
+
+The reference flow layer mirrors the source repository's `src/flow/` shape. Ported modules keep
+their semantics; the Base/EVM-specific modules reuse the pattern with their contents reauthored or
+reimplemented against EVM artifacts and Base observation semantics.
+
+| Module in this repository | Status | Notes |
+|---|---|---|
+| `src/flow/lifecycle.ts`, `src/flow/presence.ts`, `src/flow/safe-read.ts`, `src/flow/key-file.ts`, `src/flow/public-key-file.ts`, `src/flow/profile-schema.ts`, `src/flow/server.ts`, `src/flow/client.ts` | ported, semantically unchanged (chain-agnostic) | The x402 lifecycle model, the artifact presence contract, bounded hostile-input reads, key-file discipline and the express/client wiring carry no chain-specific content; `server.ts` additionally passes scheme metadata through the route price. |
+| `src/flow/issuer-key.ts`, `src/flow/issue-record.ts`, `src/flow/verify-evidence.ts`, `src/flow/tamper-demo.ts`, `src/flow/fixture-e2e.ts` | pattern reused, contents adapted | Same issuance/verification model; the chain-observation document shape, its cross-checks and the recomputed expectation comparison are this repository's own. |
+| `src/flow/failure-vocabulary.ts`, `src/flow/fixture-facilitator.ts`, `src/flow/fixture-wallet.ts` | pattern reused, contents reauthored | The closed reason vocabulary and the injection-point stand-ins are the same pattern; the supported upstream reasons, the EIP-3009 payload shape and the authorization-nonce dedupe are EVM-specific. |
+| `src/flow/observe-settlement.ts`, `src/flow/observe-transaction.ts`, `src/flow/payer-key.ts`, `src/flow/preflight.ts` | reimplemented | The Base-specific surface: the `payment_expectation` / `chain_observation` split with an explicit comparison, the sealed-L2 observation sequence, the secp256k1 payer key, and the Base Sepolia preflight have no source-repository parity. |
+| `src/test-evm-matrix.ts` | pattern reused, contents reauthored | Same matrix discipline as the source repository's SVM matrix; the EVM security cases, the upstream-facilitator probe over synthetic chain reads, and the evidence/receipt cases are this repository's own. |
+
+**Not ported / no analog in this repository:** the Solana-specific test files (`test-evidence.ts`,
+`test-keys.ts`, `test-preflight.ts`, `test-verifier-inputs.ts`) and the Solana live-run entry
+point (`devnet-demo.ts`). A live Base Sepolia execution has not yet been performed from this
+repository.
 
 ## Checksum manifest
 

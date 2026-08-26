@@ -1,0 +1,37 @@
+{
+  "profile": "org.peacprotocol.examples.payment-evidence/base-chain-observation/1",
+  "scheme": "exact",
+  "payment_expectation": {
+    "source": "native_x402_artifact",
+    "network": "eip155:84532",
+    "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    "amount_base_units": "250000",
+    "asset_decimals": 6,
+    "recipient": "0x0a419cb4517abd08f809400cc6a1236f41ee6919",
+    "payer": "0xaf75ffa7ffe35f491516746bf0e01a576169b27b",
+    "authorization_digest": "sha256:9295ce69d5b36125ca04b63872fa5ce5b3b44bad7a1c6f5b976ee8f5c1c870e1"
+  },
+  "chain_observation": {
+    "source": {
+      "kind": "in_process_fixture",
+      "reference": "offline run, no facilitator and no RPC endpoint were contacted"
+    },
+    "settlement_outcome": "succeeded",
+    "transaction_hash": "0x131655d7f0bee785962ee1c41431672593279a49b3cc010e467c6b2427c3cbff",
+    "network_reported": "eip155:84532",
+    "payer_reported": "0xaf75ffa7ffe35f491516746bf0e01a576169b27b",
+    "observed_at_unix_seconds": 1785000000
+  },
+  "comparison": {
+    "network": "match",
+    "asset": "not_evaluated",
+    "recipient": "not_evaluated",
+    "amount": "not_evaluated",
+    "authorization": "linked",
+    "transfer_event": "not_evaluated"
+  },
+  "terminal_state": "response_write_attempted",
+  "settlement_response_digest": "sha256:bf0b4a490ecb29aa8ba3f924ccb7cb12a6682bac4b346264f7e540310d4fc755",
+  "service_result_digest": "sha256:5f564269ae83a2ab0cde2d8de9fed2921ffa95e67aa7fa6035884c93bce3087c",
+  "observed_at_unix_seconds": 1785000000
+}

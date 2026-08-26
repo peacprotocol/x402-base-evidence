@@ -50,13 +50,21 @@ jobs:
       - name: Fixture path with egress diagnostics
         run: pnpm demo:offline
 
-      # REF-DET-001: the fixture walkthrough must be byte-identical run to run, or the
+      # REF-DET-001: the binding walkthrough must be byte-identical run to run, or the
       # committed vectors describe something that cannot be reproduced.
-      - name: Fixture determinism
+      - name: Binding walkthrough determinism
         run: |
-          pnpm demo:fixture > /tmp/fixture-run-1.txt
-          pnpm demo:fixture > /tmp/fixture-run-2.txt
-          diff /tmp/fixture-run-1.txt /tmp/fixture-run-2.txt
+          pnpm demo:binding > /tmp/binding-run-1.txt
+          pnpm demo:binding > /tmp/binding-run-2.txt
+          diff /tmp/binding-run-1.txt /tmp/binding-run-2.txt
+
+      # EVM-DET-001: the end-to-end run rewrites the committed evidence in place, so a difference
+      # from what is committed is a determinism failure. Comparing against the repository rather
+      # than against a second run also catches evidence committed from a different tree.
+      - name: Offline evidence determinism
+        run: |
+          pnpm demo:fixture > /dev/null
+          git diff --exit-code -- fixtures/expected-evidence
 
   offline:
     name: offline path (no network)
@@ -94,6 +102,17 @@ jobs:
             -v "$PWD:/work" -w /work \
             "$OFFLINE_NODE_IMAGE" \
             node src/fixture-demo.ts
+
+      # EVM-NET-001: the end-to-end flow serves and consumes the paid resource over the loopback
+      # interface, which exists inside a container with no network interface. Passing here is what
+      # shows that the injected facilitator and the wallet stand-in reach nothing outside the
+      # process.
+      - name: Offline end-to-end flow with networking disabled
+        run: |
+          docker run --rm --network=none \
+            -v "$PWD:/work" -w /work \
+            "$OFFLINE_NODE_IMAGE" \
+            node src/flow/fixture-e2e.ts
 
   offline-restricted:
     name: offline path (no network, restricted container)

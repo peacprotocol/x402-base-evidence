@@ -1,8 +1,18 @@
 # Secret-scanning configuration.
 #
-# The default rule set is used in full, with no repository-specific allowlist. This repository
-# commits no signed PEAC record; a committed record would be public verification material, not a
-# credential, and would need a narrowly scoped allowlist entry.
+# The default rule set is used in full. One narrowly scoped allowlist entry exists: the committed
+# deterministic evidence directory contains a signed PEAC record in JWS compact serialization,
+# which the default jwt rule matches. That record is public verification material, not a
+# credential: it is signed by the clearly labelled test-only fixture issuer key published in
+# src/flow/issuer-key.ts, covers synthetic fixture data only, and verifying it is the point of
+# committing it. The allowlist is scoped to that one path and to the jwt rule, so a real token
+# anywhere else in the repository is still a finding.
 
 [extend]
 useDefault = true
+
+[[rules]]
+id = "jwt"
+
+[rules.allowlist]
+paths = ['''fixtures/expected-evidence/record\.jws''']

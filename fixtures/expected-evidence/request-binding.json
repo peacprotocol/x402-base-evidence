@@ -1,0 +1,19 @@
+{
+  "profile": "org.peacprotocol.examples.payment-evidence/request-binding/1",
+  "components": {
+    "@method": "GET",
+    "@scheme": "https",
+    "@authority": "api.example.test",
+    "@path": "/v1/forecast",
+    "@query": "?region=alpha&units=metric",
+    "capturePoint": "origin_request_after_http_parsing",
+    "proxyTrustProfile": "direct-origin"
+  },
+  "bodyDigest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "selectedHeaders": [
+    {
+      "name": "payment-signature",
+      "observedValueDigest": "sha256:5f4b92dd1fada6010447099c3f3d3b6d8ed092bc2f3aa6db95d47d7bc22975e5"
+    }
+  ]
+}

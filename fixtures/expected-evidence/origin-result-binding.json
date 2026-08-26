@@ -1,0 +1,7 @@
+{
+  "profile": "org.peacprotocol.examples.payment-evidence/origin-result-binding/1",
+  "status": 200,
+  "contentType": "application/json",
+  "bodyDigest": "sha256:5f564269ae83a2ab0cde2d8de9fed2921ffa95e67aa7fa6035884c93bce3087c",
+  "capturePoint": "origin_pre_transfer_encoding"
+}
