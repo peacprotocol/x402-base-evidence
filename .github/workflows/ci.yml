@@ -42,7 +42,13 @@ jobs:
           package-manager-cache: false
 
       - name: Enable pnpm from the packageManager pin
-        run: corepack enable
+        # Refresh corepack before enabling it: the corepack bundled with the minimum supported Node
+        # release carries npm registry signing keys that have since rotated, so verifying the
+        # pinned pnpm's signature against the current registry fails there. Installing the current
+        # corepack restores current keys while keeping signature verification on for every runtime.
+        run: |
+          npm install --global corepack@latest
+          corepack enable
 
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -97,7 +103,13 @@ jobs:
           package-manager-cache: false
 
       - name: Enable pnpm from the packageManager pin
-        run: corepack enable
+        # Refresh corepack before enabling it: the corepack bundled with the minimum supported Node
+        # release carries npm registry signing keys that have since rotated, so verifying the
+        # pinned pnpm's signature against the current registry fails there. Installing the current
+        # corepack restores current keys while keeping signature verification on for every runtime.
+        run: |
+          npm install --global corepack@latest
+          corepack enable
 
       - name: Install
         run: pnpm install --frozen-lockfile
@@ -142,7 +154,13 @@ jobs:
           package-manager-cache: false
 
       - name: Enable pnpm from the packageManager pin
-        run: corepack enable
+        # Refresh corepack before enabling it: the corepack bundled with the minimum supported Node
+        # release carries npm registry signing keys that have since rotated, so verifying the
+        # pinned pnpm's signature against the current registry fails there. Installing the current
+        # corepack restores current keys while keeping signature verification on for every runtime.
+        run: |
+          npm install --global corepack@latest
+          corepack enable
 
       - name: Install
         run: pnpm install --frozen-lockfile
