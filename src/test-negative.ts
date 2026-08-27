@@ -22,7 +22,7 @@ import {
   type SchemaValidatedPaymentPayloadArtifact,
   type StructurallyCheckedSettleResponseArtifact,
 } from './x402-header.ts';
-import { scanForDuplicateMembers, DUPLICATE_SCAN_LIMITS } from './strict-json.ts';
+import { scanForDuplicateMembers, parseStrictJson, DUPLICATE_SCAN_LIMITS } from './strict-json.ts';
 import { canonicalizeIndependent, JcsError } from './jcs-independent.ts';
 import { asSha256Digest } from './digest.ts';
 import { beginAcceptanceSuite, recordExecution } from './acceptance-ids.ts';
@@ -474,11 +474,53 @@ check('an escaped surrogate pair key does not collide with an unrelated key',
   scanForDuplicateMembers('{"\\ud83d\\ude00":1,"a":2}').status === 'accepted');
 check('nesting beyond the declared depth bound fails closed',
   scanForDuplicateMembers('['.repeat(DUPLICATE_SCAN_LIMITS.maxDepth + 2) + ']'.repeat(DUPLICATE_SCAN_LIMITS.maxDepth + 2)).status === 'rejected');
+// The exact boundary, not just "well past it": stated maxDepth and the actual number of nested
+// scanValue calls tolerated along one chain are the SAME number, checked here precisely rather
+// than only from a safe distance. A scalar is the discriminating case: an empty innermost
+// container never needs the one extra scanValue call a scalar does, so only the scalar form
+// proves the true frame count rather than the container-open count alone.
+check('exactly maxDepth - 1 nested arrays with a scalar inside is accepted (maxDepth total scanValue calls)',
+  scanForDuplicateMembers('['.repeat(DUPLICATE_SCAN_LIMITS.maxDepth - 1) + '1' + ']'.repeat(DUPLICATE_SCAN_LIMITS.maxDepth - 1)).status === 'accepted');
+check('exactly maxDepth nested arrays with a scalar inside is refused (one scanValue call past the bound)',
+  scanForDuplicateMembers('['.repeat(DUPLICATE_SCAN_LIMITS.maxDepth) + '1' + ']'.repeat(DUPLICATE_SCAN_LIMITS.maxDepth)).status === 'rejected');
 check('trailing content after a complete value fails closed',
   scanForDuplicateMembers('{"a":1} trailing').status === 'rejected');
 check('an unterminated string fails closed', scanForDuplicateMembers('{"a":"x').status === 'rejected');
 check('a well-formed nested document is accepted',
   scanForDuplicateMembers(JSON.stringify(wellFormed)).status === 'accepted');
+
+console.log('\n  -- I-JSON string content (RFC 7493) --');
+const parses = (text: string) => parseStrictJson(Buffer.from(text, 'utf8'));
+
+recordExecution('IJSON-REJECT-001');
+check('an escaped lone high surrogate in a string value is refused',
+  parses('{"a":"\\ud800"}').status === 'refused' &&
+    (parses('{"a":"\\ud800"}') as { refusal?: string }).refusal === 'invalid_ijson_string');
+
+recordExecution('IJSON-REJECT-002');
+check('an escaped lone low surrogate as an object member name is refused',
+  parses('{"\\udc00":"x"}').status === 'refused' &&
+    (parses('{"\\udc00":"x"}') as { refusal?: string }).refusal === 'invalid_ijson_string');
+
+recordExecution('IJSON-REJECT-003');
+check('a literal noncharacter nested inside an array is refused',
+  parses('{"a":["﷐"]}').status === 'refused' &&
+    (parses('{"a":["﷐"]}') as { refusal?: string }).refusal === 'invalid_ijson_string');
+check('a plane-end noncharacter is refused the same way',
+  parses('{"a":"￿"}').status === 'refused' &&
+    (parses('{"a":"￿"}') as { refusal?: string }).refusal === 'invalid_ijson_string');
+
+recordExecution('IJSON-REJECT-004');
+check('a supplementary-plane noncharacter reached via a literal surrogate pair is refused',
+  parses('{"a":"🿾"}').status === 'refused' &&
+    (parses('{"a":"🿾"}') as { refusal?: string }).refusal === 'invalid_ijson_string');
+
+recordExecution('IJSON-ACCEPT-001');
+const emojiParsed = parses('{"a":"😀"}');
+check('a valid surrogate-pair character is accepted',
+  emojiParsed.status === 'parsed' &&
+    (emojiParsed as { value: unknown }).value !== undefined &&
+    (emojiParsed as { value: { a?: string } }).value.a === '😀');
 
 console.log('\n  -- diagnostics bounds --');
 recordExecution('X402-LIMIT-003');

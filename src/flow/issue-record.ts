@@ -36,6 +36,13 @@ import {
 } from './public-key-file.ts';
 import { chainObservationDigest, type BaseChainObservationV1 } from './observe-settlement.ts';
 import type { EvidenceArtifact } from './presence.ts';
+import {
+  fsyncDirectory,
+  injectFault,
+  isCrossDeviceError,
+  writeFileDurably,
+  type FaultInjectionHook,
+} from './durable-write.ts';
 
 const APP_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
@@ -257,11 +264,11 @@ export class EvidenceCollisionError extends Error {
 }
 
 /**
- * Reserve a run's output paths and write the material a reviewer needs, before anything is spent.
+ * Reserve a run's output paths and write the material a recipient needs, before anything is spent.
  *
  * WHY THIS RUNS FIRST. The evidence a live run produces is verifiable only alongside the public
  * half of the key it was signed with. Writing that key after the evidence leaves a window in which
- * devnet funds have already moved and the material a reviewer needs cannot be produced: a full
+ * devnet funds have already moved and the material a recipient needs cannot be produced: a full
  * transcript of a real payment, unusable by anyone else. So both output paths are claimed and the
  * key file is written and read back before the run is allowed to reach a payment at all.
  *
@@ -273,26 +280,33 @@ export class EvidenceCollisionError extends Error {
  * @param input.evidenceDirectory - Where complete evidence will belong. Must not exist.
  * @param input.publicKeyFile - Where the public half of the signing key goes. Must not exist.
  * @param input.issuerKey - The key this run will sign with. Only its public half is written.
- * @returns The key file as read back from disk, so what a reviewer will load is what was checked.
+ * @returns The key file as read back from disk, so what a recipient will load is what was checked.
  * @throws EvidenceCollisionError when either path is taken, before anything is written.
  * @throws InvalidPublicKeyFileError when the file just written does not read back as a key.
  */
-export function prepareRunOutputs(input: {
-  readonly evidenceDirectory: string;
-  readonly publicKeyFile: string;
-  readonly issuerKey: { readonly publicKey: Uint8Array; readonly kid: string; readonly iss: string };
-}): LoadedIssuerPublicKey {
+export function prepareRunOutputs(
+  input: {
+    readonly evidenceDirectory: string;
+    readonly publicKeyFile: string;
+    readonly issuerKey: { readonly publicKey: Uint8Array; readonly kid: string; readonly iss: string };
+  } & FaultInjectionHook,
+): LoadedIssuerPublicKey {
   const { evidenceDirectory, publicKeyFile, issuerKey } = input;
   if (existsSync(evidenceDirectory)) throw new EvidenceCollisionError(evidenceDirectory);
   if (existsSync(publicKeyFile)) {
     throw new EvidenceCollisionError(publicKeyFile, 'A verification key file');
   }
 
-  mkdirSync(dirname(publicKeyFile), { recursive: true });
+  const keyDirectory = dirname(publicKeyFile);
+  mkdirSync(keyDirectory, { recursive: true });
   // Written exclusively, so a file that appeared between the check above and this line is a
-  // collision rather than something to overwrite.
+  // collision rather than something to overwrite. `writeIssuerPublicKeyFile` fsyncs the file's own
+  // bytes; the directory entry pointing at it is a separate fact, made durable by the fsync below,
+  // and this gate is not satisfied until both hold.
   writeIssuerPublicKeyFile(publicKeyFile, issuerKey);
-  // Read back through the same reader a reviewer uses: a file that cannot be loaded is discovered
+  injectFault(input, 'after-key-file-fsync');
+  fsyncDirectory(keyDirectory);
+  // Read back through the same reader a recipient uses: a file that cannot be loaded is discovered
   // here, where nothing has been spent, rather than by the person the evidence was handed to.
   return readIssuerPublicKeyFile(publicKeyFile);
 }
@@ -318,17 +332,29 @@ function stagingToken(): string {
  * incomplete, the destination still does not exist, and a run that has already spent real funds
  * should not have its artifacts discarded to keep the output tidy.
  *
+ * DURABILITY. Every file is opened, written and `fsync`ed before its descriptor closes; every
+ * directory the write touched — the staging directory, and any subdirectory the layout's relative
+ * paths created inside it — is then `fsync`ed itself, so the staged set is durable on disk before
+ * `finalize` (and therefore before the rename) ever runs. The rename is refused, not silently
+ * retried as a copy, if it would cross a filesystem boundary (`EXDEV`); after a successful rename,
+ * the PARENT directory is `fsync`ed, because the rename's directory-entry change — the staged name
+ * disappearing and the final name appearing — is a change to the parent's own contents, durable
+ * only once the parent itself is. See `durable-write.ts` for the exact contract this supports and
+ * the platforms it does not (a network filesystem, or Windows for the directory-entry half).
+ *
  * @param input.finalDirectory - Where complete evidence belongs. Must not already exist.
  * @param input.layout - The artifacts to write.
  * @param input.finalize - Verification and anything else that belongs in the directory, run against
  *   the staged path so its output arrives with the rest or not at all. Throwing aborts the move.
  * @throws EvidenceCollisionError when the destination exists, before anything is written.
  */
-export async function writeEvidenceTransactionally(input: {
-  readonly finalDirectory: string;
-  readonly layout: EvidenceLayout;
-  readonly finalize: (stagedDirectory: string) => Promise<void>;
-}): Promise<void> {
+export async function writeEvidenceTransactionally(
+  input: {
+    readonly finalDirectory: string;
+    readonly layout: EvidenceLayout;
+    readonly finalize: (stagedDirectory: string) => Promise<void>;
+  } & FaultInjectionHook,
+): Promise<void> {
   const { finalDirectory, layout, finalize } = input;
   if (existsSync(finalDirectory)) throw new EvidenceCollisionError(finalDirectory);
 
@@ -339,11 +365,51 @@ export async function writeEvidenceTransactionally(input: {
   // write into, and the run stops rather than mixing two emissions together.
   mkdirSync(staged);
 
-  writeEvidence(staged, layout);
+  const writtenDirectories = new Set<string>([staged]);
+  for (const [relativePath, bytes] of layout.files) {
+    // INVARIANT, ASSERTED: every `EvidenceArtifact` name is either bare or exactly one directory
+    // deep (`presence.ts`'s `EVIDENCE_ARTIFACTS`, a closed union — the deepest entry today is
+    // `artifacts/payment-required.txt`). That is what makes fsyncing `staged` plus each file's
+    // direct parent below cover every directory this write touches: there is never an
+    // intermediate directory between `staged` and a file's own parent to miss. Checked here at
+    // runtime, not only relied on as a type-level fact, so a future artifact nested two levels
+    // deep fails loudly instead of silently shipping an un-fsynced intermediate directory.
+    if (relativePath.split('/').length > 2) {
+      throw new Error(
+        `evidence artifact path "${relativePath}" is nested more than one directory deep; ` +
+          'writeEvidenceTransactionally assumes EVIDENCE_ARTIFACTS never is, and its directory-fsync ' +
+          'coverage would need to walk the full parent chain if that assumption ever changes',
+      );
+    }
+    const target = join(staged, relativePath);
+    const targetDirectory = dirname(target);
+    mkdirSync(targetDirectory, { recursive: true });
+    writtenDirectories.add(targetDirectory);
+    writeFileDurably(target, bytes);
+  }
+  injectFault(input, 'after-file-fsync');
+  for (const directory of writtenDirectories) fsyncDirectory(directory);
+  injectFault(input, 'after-staging-directory-fsync');
+
   await finalize(staged);
 
   // Re-checked immediately before the move, because the destination is decided by a clock and two
   // runs could reach this point in the same second.
   if (existsSync(finalDirectory)) throw new EvidenceCollisionError(finalDirectory);
-  renameSync(staged, finalDirectory);
+  try {
+    injectFault(input, 'before-rename');
+    renameSync(staged, finalDirectory);
+  } catch (e) {
+    if (isCrossDeviceError(e)) {
+      throw new Error(
+        `evidence publication requires the staging directory and ${finalDirectory} to be on the ` +
+          'same filesystem (the rename would cross a filesystem boundary, EXDEV); nothing was ' +
+          'published, and the staged directory is left in place for inspection',
+      );
+    }
+    throw e;
+  }
+  injectFault(input, 'after-rename');
+  fsyncDirectory(parent);
+  injectFault(input, 'after-parent-directory-fsync');
 }

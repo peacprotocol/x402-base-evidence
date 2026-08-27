@@ -190,9 +190,17 @@ export function compareExpectationToObservation(
   // value. Any piece the expectation cannot state, above all the authorized payer, leaves the
   // verdict a mismatch rather than a partial match, because "mostly the expected transfer" is not
   // a category this document is willing to invent.
+  //
+  // EXACTLY ONE, NOT "AT LEAST ONE". The pinned x402/EIP-3009 settlement path issues a single
+  // `transferWithAuthorization` contract call, never a batch, so a standard ERC-20 token contract
+  // emits exactly one Transfer event per settlement. `matching_transfer_count` carries the actual
+  // count the observation found; requiring it to equal exactly 1 is what keeps two or more
+  // matching events — which this document's shape can represent but never silently resolves by
+  // picking one — from reading as an unambiguous match.
   const transferMatches =
     transfer !== undefined &&
     expectation.payer !== undefined &&
+    document.rpc_observation?.matching_transfer_count === 1 &&
     transferMatchesExpected(transfer, {
       token_contract: expectation.asset,
       transfer_from: expectation.payer,

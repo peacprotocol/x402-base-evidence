@@ -40,6 +40,13 @@ import { verifyLocal, computeJsonDocumentDigestJcs } from '@peac/protocol';
 import type { JsonValue } from '@peac/kernel';
 import { coerceDigest, digestBytes, type Sha256Digest } from '../digest.ts';
 import { decodeStrictUtf8, parseStrictJson, type StrictJsonRefusal } from '../strict-json.ts';
+import { terminalSafe } from '../terminal-safe.ts';
+import {
+  requireValidX402Artifact,
+  X402ValidationError,
+  type SchemaValidatedPaymentRequiredArtifact,
+  type SchemaValidatedPaymentPayloadArtifact,
+} from '../x402-header.ts';
 import { checkPresence, EVIDENCE_ARTIFACTS, type EvidenceArtifact } from './presence.ts';
 import {
   ARTIFACT_CONTAINERS,
@@ -70,6 +77,11 @@ import {
   SUPPLIED_KEY_CAVEAT,
   type LoadedIssuerPublicKey,
 } from './public-key-file.ts';
+import {
+  deriveExpectedEvidenceProjection,
+  type EvidenceProjectionV1,
+  type ProjectedField,
+} from './evidence-projection.ts';
 
 /**
  * The one x402 scheme this example observes.
@@ -101,11 +113,114 @@ export interface VerificationWarning {
   readonly detail: string;
 }
 
+/**
+ * The distinct questions a directory's checks answer, kept separate on purpose.
+ *
+ * A signature being valid says nothing about whether the record's claims agree with the bound
+ * evidence; an x402 artifact being independently revalidated says nothing about whether the
+ * chain-observation cross-checks agree; a supplied key's declared issuer matching the record says
+ * nothing about whether that issuer is who it claims to be. Collapsing these into one boolean is
+ * exactly the overstatement this split exists to prevent — a success in one authority never
+ * implies a success, or even that anything was checked, in another.
+ *
+ *   artifact_integrity          every bound digest recomputes; the artifact set matches the
+ *                                presence contract for the claimed terminal state.
+ *   x402_native_validation      the observed x402 artifacts independently re-validate under the
+ *                                pinned upstream x402 validators (never invented for an artifact
+ *                                x402 defines no runtime validator for).
+ *   peac_signature               the record's signature and Wire 0.2 schema are intact.
+ *   evidence_projection          the record's claims agree with what this evidence set
+ *                                independently derives, per `evidence-projection.ts`.
+ *   chain_observation_consistency  the chain-observation document is internally well formed and
+ *                                its cross-document fields agree with the record and each other.
+ *   trust_policy                  a supplied key's declared algorithm, kid and issuer agree with
+ *                                the record. Never an identity claim; see `SUPPLIED_KEY_CAVEAT`.
+ */
+export type AuthorityName =
+  | 'artifact_integrity'
+  | 'x402_native_validation'
+  | 'peac_signature'
+  | 'evidence_projection'
+  | 'chain_observation_consistency'
+  | 'trust_policy';
+
+export const AUTHORITY_NAMES: readonly AuthorityName[] = [
+  'artifact_integrity',
+  'x402_native_validation',
+  'peac_signature',
+  'evidence_projection',
+  'chain_observation_consistency',
+  'trust_policy',
+];
+
+/** One authority's verdict: `valid` only if every check under it ran and passed. */
+export type AuthorityVerdict = 'valid' | 'invalid' | 'not_evaluated';
+
+/**
+ * Which authority a check belongs to, decided from its name.
+ *
+ * A name-based classification, not a per-call-site tag, so every check — including the ones
+ * report-only early exits construct inline — is classified the same way without threading an
+ * authority parameter through every `pass`/`fail` call in this file.
+ */
+export function classifyAuthority(checkName: string): AuthorityName {
+  if (checkName.startsWith('x402 native validation')) return 'x402_native_validation';
+  if (checkName.startsWith('evidence projection') || checkName === 'record type') {
+    return 'evidence_projection';
+  }
+  if (checkName.startsWith('supplied key')) return 'trust_policy';
+  if (checkName === 'record signature and schema' || checkName === 'extension groups') {
+    return 'peac_signature';
+  }
+  if (
+    checkName.includes('digest') ||
+    checkName.includes('local profile') ||
+    checkName === 'chain observation schema' ||
+    checkName === 'every artifact is readable' ||
+    checkName === 'nested artifact directories are directories' ||
+    checkName === 'record present' ||
+    checkName === 'artifact presence contract' ||
+    checkName === 'origin result body'
+  ) {
+    return 'artifact_integrity';
+  }
+  return 'chain_observation_consistency';
+}
+
+/** Roll a check list up into one verdict per authority. */
+export function summarizeAuthorities(
+  checks: readonly VerificationCheck[],
+): Readonly<Record<AuthorityName, AuthorityVerdict>> {
+  const summary = {} as Record<AuthorityName, AuthorityVerdict>;
+  for (const authority of AUTHORITY_NAMES) summary[authority] = 'not_evaluated';
+  for (const check of checks) {
+    const authority = classifyAuthority(check.name);
+    if (summary[authority] === 'invalid') continue;
+    summary[authority] = check.ok ? (summary[authority] === 'not_evaluated' ? 'valid' : summary[authority]) : 'invalid';
+  }
+  return summary;
+}
+
 export interface EvidenceVerificationReport {
   readonly ok: boolean;
   readonly checks: readonly VerificationCheck[];
   /** Never affects `ok`. See `VerificationWarning`. */
   readonly warnings: readonly VerificationWarning[];
+  /**
+   * One verdict per authority, computed from `checks`. `ok` is never a substitute for reading
+   * this: `ok` answers "was every check that ran satisfied", and this answers "which distinct
+   * questions were actually asked, and what did each one conclude".
+   */
+  readonly authorities: Readonly<Record<AuthorityName, AuthorityVerdict>>;
+}
+
+/** Build a finished report: `ok`, the checks, the warnings, and the per-authority summary. */
+function finishReport(
+  ok: boolean,
+  checks: readonly VerificationCheck[],
+  warnings: readonly VerificationWarning[],
+): EvidenceVerificationReport {
+  return { ok, checks, warnings, authorities: summarizeAuthorities(checks) };
 }
 
 const pass = (name: string, detail = ''): VerificationCheck => ({ name, ok: true, detail });
@@ -160,15 +275,16 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * A bounded rendering of a value read out of a document.
+ * A bounded, terminal-safe rendering of a value read out of a document.
  *
- * Report text is the one place attacker-controlled content could reach a reader's terminal at
- * whatever length it likes, so a value taken from a file is described rather than reproduced.
+ * Report text is the one place attacker-controlled content could reach a reader's terminal: not
+ * merely at whatever length it likes, but carrying whatever control characters it likes. Bounding
+ * length alone does not stop a CR/LF from forging an extra report line or an ESC byte from opening
+ * a terminal escape sequence, so every value that reaches this function is escaped, via
+ * `terminalSafe`, before it is ever bounded.
  */
 function describeBound(value: unknown): string {
-  if (typeof value === 'string') return value.length <= 80 ? value : `${value.slice(0, 80)}...`;
-  if (typeof value === 'object' && value !== null) return 'a value that is not a string';
-  return String(value).slice(0, 80);
+  return terminalSafe(value, 80);
 }
 
 function isTerminalState(value: unknown): value is TerminalState {
@@ -204,6 +320,46 @@ export async function verifyEvidence(
   const checks: VerificationCheck[] = [];
   const warnings: VerificationWarning[] = [];
 
+  /** Compare one derived projection field against what the record claims, in JSON terms. */
+  const jsonEqual = (a: unknown, b: unknown): boolean => {
+    if (Array.isArray(a) || Array.isArray(b)) {
+      return Array.isArray(a) && Array.isArray(b) && a.length === b.length &&
+        a.every((v, i) => jsonEqual(v, (b as readonly unknown[])[i]));
+    }
+    return a === b;
+  };
+
+  /**
+   * Record one evidence-projection field.
+   *
+   * `derived` is the only status whose disagreement fails this check and therefore the whole
+   * report: this evidence set independently supplies an expected value, and the record disagreeing
+   * with it is exactly what `evidence_projection: inconsistent` means. The other two statuses never
+   * fail: `not_derivable_for_this_evidence` and `issuer_assertion` both mean this evidence set has
+   * no independent answer, and a check that failed for that reason would be reporting a defect in
+   * the evidence rather than in the record.
+   */
+  const projectionCheck = (name: string, field: ProjectedField<unknown>, actual: unknown): void => {
+    const label = `evidence projection: ${name}`;
+    if (field.status === 'issuer_assertion') {
+      checks.push(pass(label, 'issuer assertion; this evidence set does not independently establish it'));
+      return;
+    }
+    if (field.status === 'not_derivable_for_this_evidence') {
+      checks.push(pass(label, `not derivable from this evidence: ${field.reason}`));
+      return;
+    }
+    checks.push(
+      jsonEqual(field.expected, actual)
+        ? pass(label, describeBound(JSON.stringify(field.expected)))
+        : fail(
+            label,
+            `the evidence establishes ${describeBound(JSON.stringify(field.expected))}, ` +
+              `the record carries ${describeBound(JSON.stringify(actual))}`,
+          ),
+    );
+  };
+
   // The directories the artifact names descend through, before any of those names is read. A
   // symlink standing in for one would leave every path below it looking like it names this
   // evidence directory while the bytes came from somewhere else, so it is refused here rather than
@@ -211,16 +367,16 @@ export async function verifyEvidence(
   for (const container of ARTIFACT_CONTAINERS) {
     const state = checkContainerDirectory(join(directory, container));
     if (state.kind === 'refused') {
-      return {
-        ok: false,
-        checks: [
+      return finishReport(
+        false,
+        [
           fail(
             'nested artifact directories are directories',
             `${container} was refused (${state.refusal}: ${state.detail})`,
           ),
         ],
         warnings,
-      };
+      );
     }
   }
 
@@ -235,16 +391,16 @@ export async function verifyEvidence(
     else if (read.kind === 'unreadable') unreadable.push(`${artifact} (${read.reason})`);
   }
   if (unreadable.length > 0) {
-    return {
-      ok: false,
-      checks: [
+    return finishReport(
+      false,
+      [
         fail(
           'every artifact is readable',
           `refused, and absence must not be assumed: ${unreadable.join('; ')}`,
         ),
       ],
       warnings,
-    };
+    );
   }
 
   /**
@@ -285,18 +441,18 @@ export async function verifyEvidence(
 
   const recordBytes = present.get('record.jws');
   if (recordBytes === undefined) {
-    return { ok: false, checks: [fail('record present', 'record.jws is missing')], warnings };
+    return finishReport(false, [fail('record present', 'record.jws is missing')], warnings);
   }
   // Decoded fatally, like every other document here. A record is base64url text, so bytes that are
   // not valid UTF-8 are not a record; replacing what is malformed would hand the verification
   // primitive a string nobody signed.
   const recordText = decodeStrictUtf8(recordBytes);
   if (recordText === undefined) {
-    return {
-      ok: false,
-      checks: [fail('record signature and schema', 'the record bytes are not valid UTF-8')],
+    return finishReport(
+      false,
+      [fail('record signature and schema', 'the record bytes are not valid UTF-8')],
       warnings,
-    };
+    );
   }
   const jws = recordText.trim();
 
@@ -306,24 +462,22 @@ export async function verifyEvidence(
   try {
     verified = await verifyLocal(jws, publicKey);
   } catch {
-    return {
-      ok: false,
-      checks: [fail('record signature and schema', 'the record could not be read as a PEAC record')],
+    return finishReport(
+      false,
+      [fail('record signature and schema', 'the record could not be read as a PEAC record')],
       warnings,
-    };
+    );
   }
   if (!verified.valid) {
-    return {
-      ok: false,
-      checks: [fail('record signature and schema', `${verified.code}`)],
-      warnings,
-    };
+    return finishReport(false, [fail('record signature and schema', `${verified.code}`)], warnings);
   }
-  checks.push(pass('record signature and schema', `verified under kid ${verified.kid}`));
+  checks.push(pass('record signature and schema', `verified under kid ${describeBound(verified.kid)}`));
 
   const claims = verified.claims as unknown as {
     iss?: unknown;
     type?: string;
+    kind?: unknown;
+    pillars?: unknown;
     extensions?: Record<string, Record<string, unknown>>;
   };
 
@@ -348,7 +502,7 @@ export async function verifyEvidence(
     );
     checks.push(
       suppliedKey.kid === verified.kid
-        ? pass('supplied key identifier matches the record', verified.kid)
+        ? pass('supplied key identifier matches the record', describeBound(verified.kid))
         : fail(
             'supplied key identifier matches the record',
             `the key file names ${describeBound(suppliedKey.kid)}, ` +
@@ -357,7 +511,7 @@ export async function verifyEvidence(
     );
     checks.push(
       suppliedKey.issuer === claims.iss
-        ? pass('supplied key issuer matches the record', suppliedKey.issuer)
+        ? pass('supplied key issuer matches the record', describeBound(suppliedKey.issuer))
         : fail(
             'supplied key issuer matches the record',
             `the key file names ${describeBound(suppliedKey.issuer)}, ` +
@@ -368,14 +522,14 @@ export async function verifyEvidence(
   checks.push(
     claims.type === RECORD_TYPE
       ? pass('record type', RECORD_TYPE)
-      : fail('record type', `expected ${RECORD_TYPE}, record carries ${String(claims.type)}`),
+      : fail('record type', `expected ${RECORD_TYPE}, record carries ${describeBound(claims.type)}`),
   );
 
   const commerce = claims.extensions?.[COMMERCE_GROUP];
   const evidence = claims.extensions?.[PAYMENT_EVIDENCE_GROUP];
   if (commerce === undefined || evidence === undefined) {
     checks.push(fail('extension groups', 'the record is missing a required extension group'));
-    return { ok: false, checks, warnings };
+    return finishReport(false, checks, warnings);
   }
   checks.push(pass('extension groups', `${COMMERCE_GROUP}, ${PAYMENT_EVIDENCE_GROUP}`));
 
@@ -507,6 +661,122 @@ export async function verifyEvidence(
     evidence['payment_response_digest'],
   );
 
+  // x402 native validation: independently re-validate the observed x402 artifacts through the
+  // SAME pinned upstream validators this repository calls at issuance and everywhere else it
+  // handles x402 artifacts — never a bespoke reimplementation, and never a claim about an
+  // artifact x402 v2 defines no runtime validator for. A digest recomputing only proves these are
+  // the bytes the record bound; it says nothing about whether those bytes are themselves a
+  // well-formed x402 object, which is the distinct question this authority answers.
+  const decodedText = (artifact: EvidenceArtifact): string | undefined => {
+    const bytes = present.get(artifact);
+    return bytes === undefined ? undefined : decodeStrictUtf8(bytes);
+  };
+
+  let promotedRequired: SchemaValidatedPaymentRequiredArtifact | undefined;
+  const requiredText = decodedText('artifacts/payment-required.txt');
+  if (requiredText === undefined) {
+    checks.push(pass('x402 native validation: payment-required', 'not present'));
+  } else {
+    try {
+      const validated = await requireValidX402Artifact({
+        name: 'payment-required',
+        observedValue: requiredText,
+        capturePoint: 'origin_response_before_gateway',
+        httpVersion: '1.1',
+      });
+      if (validated.artifactType === 'PaymentRequired') {
+        promotedRequired = validated;
+        checks.push(
+          pass(
+            'x402 native validation: payment-required',
+            'valid under the pinned upstream x402 v2 validator',
+          ),
+        );
+      } else {
+        checks.push(
+          fail('x402 native validation: payment-required', 'did not validate as a PaymentRequired object'),
+        );
+      }
+    } catch (e) {
+      checks.push(
+        fail(
+          'x402 native validation: payment-required',
+          e instanceof X402ValidationError ? describeBound(e.message) : 'refused by the upstream validator',
+        ),
+      );
+    }
+  }
+
+  let promotedPayload: SchemaValidatedPaymentPayloadArtifact | undefined;
+  const signatureText = decodedText('artifacts/payment-signature.txt');
+  if (signatureText === undefined) {
+    checks.push(pass('x402 native validation: payment-signature', 'not present'));
+  } else {
+    try {
+      const validated = await requireValidX402Artifact({
+        name: 'payment-signature',
+        observedValue: signatureText,
+        capturePoint: 'origin_request_after_http_parsing',
+        httpVersion: '1.1',
+      });
+      if (validated.artifactType === 'PaymentPayload') {
+        promotedPayload = validated;
+        checks.push(
+          pass(
+            'x402 native validation: payment-signature',
+            'valid Exact/EVM scheme shape under the pinned upstream x402 v2 validator',
+          ),
+        );
+      } else {
+        checks.push(
+          fail('x402 native validation: payment-signature', 'did not validate as a PaymentPayload object'),
+        );
+      }
+    } catch (e) {
+      checks.push(
+        fail(
+          'x402 native validation: payment-signature',
+          e instanceof X402ValidationError ? describeBound(e.message) : 'refused by the upstream validator',
+        ),
+      );
+    }
+  }
+
+  // Term matching: the presented terms (`accepted`) must be exactly one of the entries the
+  // PaymentRequired challenge advertised (`accepts`). Structural equality over both promoted,
+  // upstream-validated objects; no chain read is needed to compare two documents this evidence
+  // already carries. Cryptographic EIP-3009 signature recovery and the validAfter/validBefore
+  // time-window check are NOT re-run here: both require the upstream facilitator's `.verify()`
+  // path, which takes chain-read capabilities this offline verifier does not have and cannot
+  // honestly stand in for; disclosed as a scope boundary, not an oversight.
+  if (promotedRequired !== undefined && promotedPayload !== undefined) {
+    const accepts = promotedRequired.decoded.accepts;
+    const accepted = promotedPayload.decoded.accepted;
+    const matches =
+      Array.isArray(accepts) &&
+      accepts.some((accept) => JSON.stringify(accept) === JSON.stringify(accepted));
+    checks.push(
+      matches
+        ? pass('x402 native validation: term matching', 'the presented terms match an advertised accept entry')
+        : fail(
+            'x402 native validation: term matching',
+            'the presented terms match no entry the payment-required challenge advertised',
+          ),
+    );
+  }
+
+  // payment-response: x402 v2 core defines no upstream runtime validator for SettleResponse (see
+  // SETTLE_RESPONSE_LOCAL_AUTHORITY in x402-header.ts), so no upstream x402 authority is invented
+  // for it here. Its digest is still checked above, under artifact_integrity.
+  if (decodedText('artifacts/payment-response.txt') !== undefined) {
+    checks.push(
+      pass(
+        'x402 native validation: payment-response',
+        'not_evaluated: x402 v2 core defines no upstream runtime validator for SettleResponse',
+      ),
+    );
+  }
+
   // The result binding names the body by digest, so the body is checked against the binding rather
   // than against the record: that is where the claim about the bytes actually lives.
   const resultBinding = readJsonArtifact('origin-result-binding.json');
@@ -538,7 +808,7 @@ export async function verifyEvidence(
   const terminalState = evidence['terminal_state'];
   if (!isTerminalState(terminalState)) {
     checks.push(fail('terminal state', 'the record carries no recognised terminal state'));
-    return { ok: false, checks, warnings };
+    return finishReport(false, checks, warnings);
   }
   const violations = checkPresence(terminalState, new Set(present.keys()));
   checks.push(
@@ -563,6 +833,20 @@ export async function verifyEvidence(
     checks.push(fail('chain observation', 'chain-observation.json is not a JSON object'));
   } else if (observationRead.kind === 'parsed') {
     const observationDocument = observationRead.value as Record<string, unknown>;
+
+    // The closed application/profile schema, run BEFORE anything below reads a single field out
+    // of this document: additionalProperties:false, closed enums, exact CAIP-2/hash/address
+    // grammar, bounded strings and arrays. This is not a PEAC normative schema — see
+    // `schemas/base-chain-observation.v1.schema.json` — and satisfying it is not PEAC or x402
+    // conformance; it only proves this document has the shape this example itself produces.
+    const schemaResult = validateLocalProfile('base-chain-observation', observationDocument);
+    checks.push(
+      schemaResult.ok
+        ? pass('chain observation schema', 'matches the example-local closed schema')
+        : fail('chain observation schema', schemaResult.detail),
+    );
+    if (!schemaResult.ok) return finishReport(false, checks, warnings);
+
     const expectation = isJsonObject(observationDocument['payment_expectation'])
       ? (observationDocument['payment_expectation'] as Record<string, unknown>)
       : undefined;
@@ -606,7 +890,57 @@ export async function verifyEvidence(
           ),
     );
     if (expectation === undefined || report === undefined) {
-      return { ok: false, checks, warnings };
+      return finishReport(false, checks, warnings);
+    }
+
+    // The evidence projection: every claim the record makes that this bound evidence set can
+    // independently establish, derived the same way the issuer derived it, and compared here
+    // against what the record actually carries. A record whose kind, pillars, payment rail,
+    // network, asset, amount, environment, settlement event, or lifecycle positions disagree with
+    // what the evidence independently implies is never trusted, regardless of its signature.
+    const terminalStateForProjection = observationDocument['terminal_state'];
+    if (!isTerminalState(terminalStateForProjection)) {
+      checks.push(
+        fail(
+          'evidence projection',
+          'the observation names no recognised terminal state, so no projection can be derived',
+        ),
+      );
+    } else {
+      const paymentSignatureBytes = present.get('artifacts/payment-signature.txt');
+      const paymentSignatureText =
+        paymentSignatureBytes === undefined ? undefined : decodeStrictUtf8(paymentSignatureBytes);
+      const chainObservationForProjection = {
+        profile: observationDocument['profile'],
+        scheme: observationDocument['scheme'],
+        payment_expectation: expectation,
+        chain_observation: report,
+        terminal_state: terminalStateForProjection,
+      } as unknown as BaseChainObservationV1;
+
+      const projection: EvidenceProjectionV1 = await deriveExpectedEvidenceProjection({
+        chainObservation: chainObservationForProjection,
+        x402Artifacts: { paymentSignature: paymentSignatureText },
+      });
+
+      projectionCheck('kind', projection.kind, claims.kind);
+      projectionCheck('pillars', projection.pillars, claims.pillars);
+      projectionCheck('payment_rail', projection.paymentRail, commerce['payment_rail']);
+      projectionCheck('network', projection.network, evidence['network']);
+      projectionCheck('asset', projection.asset, commerce['asset']);
+      projectionCheck('amount_minor', projection.amountMinor, commerce['amount_minor']);
+      projectionCheck('env', projection.env, commerce['env']);
+      projectionCheck('event', projection.event, commerce['event']);
+      projectionCheck('lifecycle_states', projection.lifecycleStates, evidence['lifecycle_states']);
+      projectionCheck('reference', projection.reference, commerce['reference']);
+      // currency, occurred_at, and jti are issuer assertions: no piece of this evidence set
+      // establishes any of the three, so they are reported as exactly that and never compared.
+      // The third argument is never read for an `issuer_assertion` field; `undefined` stands in
+      // for "no independent value to compare against" honestly, rather than naming a record field
+      // this check does not use.
+      projectionCheck('currency', projection.currency, commerce['currency']);
+      projectionCheck('occurred_at', projection.occurredAt, undefined);
+      projectionCheck('jti', projection.jti, undefined);
     }
 
     const settled = report['settlement_outcome'] === 'succeeded';
@@ -817,25 +1151,15 @@ export async function verifyEvidence(
       );
     };
 
-    agreeOnValue(
-      'record and observation name the same network',
-      evidence['network'],
-      expectation['network'],
-    );
+    // Network, asset, and amount agreement between the record and the observation are covered by
+    // the evidence projection above (`evidence projection: network` / `asset` / `amount_minor`),
+    // which compares the record against the same expectation this check would have; a second,
+    // separately named comparison of the identical fact would be a second path to the same
+    // conclusion, not a second fact.
     agreeOnValue(
       'record and observation name the same terminal state',
       terminalState,
       observationDocument['terminal_state'],
-    );
-    agreeOnValue(
-      'record and observation name the same asset',
-      commerce['asset'],
-      expectation['asset'],
-    );
-    agreeOnValue(
-      'record and observation name the same amount',
-      commerce['amount_minor'],
-      expectation['amount_base_units'],
     );
     agreeOnOptionalDigest(
       'record and observation name the same settlement response digest',
@@ -864,7 +1188,7 @@ export async function verifyEvidence(
     }
   }
 
-  return { ok: checks.every((c) => c.ok), checks, warnings };
+  return finishReport(checks.every((c) => c.ok), checks, warnings);
 }
 
 /** A command line this verifier cannot act on. Never raised for evidence that simply fails. */

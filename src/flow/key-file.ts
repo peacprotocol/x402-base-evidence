@@ -106,6 +106,8 @@ const STRICT_REFUSALS: Readonly<Record<StrictJsonRefusal, string>> = {
   duplicate_member:
     'it declares the same member twice, so what it names depends on the parser reading it',
   depth_limit_exceeded: 'it nests deeper than a key file is read',
+  invalid_ijson_string:
+    'it contains a string that is not valid under RFC 7493 (an unpaired surrogate or a Unicode noncharacter)',
 };
 
 /**

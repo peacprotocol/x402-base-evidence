@@ -120,18 +120,24 @@ class FixtureExactEvmFacilitator implements SchemeNetworkFacilitator {
   readonly caipFamily = 'eip155:*';
 
   /**
-   * Authorizer-and-nonce pairs this instance has already settled.
+   * Authorizer-and-nonce pairs, keyed by where each one stands: absent (available), `'pending'`
+   * (a settlement attempt is in flight for it), or `'consumed'` (a settlement of it has already
+   * succeeded).
    *
-   * On the network, a consumed EIP-3009 authorization cannot produce a second transfer, and the
-   * consumed state is keyed by the pair `(authorizer, nonce)` — never by the nonce alone, since
-   * two authorizers may independently use the same nonce value. This set models that
-   * authorizer-scoped fixture consumption so the repeated-settlement branch of the lifecycle is
-   * reachable without a chain; it belongs to one facilitator instance, dedupes within a run, and
-   * never carries state between runs. It is a stand-in and is recorded as one: it does not claim
-   * to prove the network's replay mechanism, and no output derived from it names the mechanism a
-   * real facilitator or the network enforces.
+   * On the network, EIP-3009 keys consumption by the pair `authorizationState(address authorizer,
+   * bytes32 nonce)` — never by the nonce alone, since two authorizers may independently use the
+   * same nonce value — and only a transfer that actually executes consumes it. This map models
+   * that: an authorization is reserved as `'pending'` before any failure path in `settle` below
+   * can run, so a duplicate attempt arriving while the first is still in flight is refused rather
+   * than racing it, and the reservation is released back to available on every path except a
+   * settlement that actually succeeds. A refusal, a thrown error, or a term mismatch must leave an
+   * authorization exactly as spendable as it was before the attempt; only a successful settlement
+   * may move it to `'consumed'`, which is permanent for this instance. It belongs to one
+   * facilitator instance, applies within a run, and never carries state between runs. It is a
+   * stand-in and is recorded as one: it does not claim to prove the network's replay mechanism,
+   * and no output derived from it names the mechanism a real facilitator or the network enforces.
    */
-  private readonly settledAuthorizations = new Set<string>();
+  private readonly settledAuthorizations = new Map<string, 'pending' | 'consumed'>();
 
   private readonly behavior: FixtureFacilitatorBehavior;
   private readonly calls: FixtureFacilitatorCalls;
@@ -163,14 +169,30 @@ class FixtureExactEvmFacilitator implements SchemeNetworkFacilitator {
     return { isValid: true, payer: F.PAYER };
   }
 
+  /**
+   * Settle one payment.
+   *
+   * Only a settlement that actually succeeds may consume the authorization it settled. Every
+   * other path — a duplicate arriving while the first is still in flight, an injected throw, an
+   * injected refusal, or an ordinary term mismatch — must leave the authorization exactly as
+   * available as it was before this call, so a caller can safely retry it. The reservation is
+   * taken before any of those paths can run and before this method's first `await` (there is none
+   * today, but the reservation is written so that adding one later still cannot let two attempts
+   * for the same identity both observe "available").
+   */
   async settle(
     payload: PaymentPayload,
     requirements: PaymentRequirements,
   ): Promise<SettleResponse> {
     this.calls.settle++;
     const identity = authorizationIdentity(payload);
+
     if (identity !== undefined) {
-      if (this.settledAuthorizations.has(identity)) {
+      const state = this.settledAuthorizations.get(identity);
+      if (state !== undefined) {
+        // Already consumed by an earlier success, or currently reserved by an attempt still in
+        // flight for the same identity: either way, this attempt must not proceed and must not
+        // disturb what the other one recorded.
         return {
           success: false,
           errorReason: DUPLICATE_SETTLEMENT_REASON,
@@ -179,12 +201,20 @@ class FixtureExactEvmFacilitator implements SchemeNetworkFacilitator {
           payer: F.PAYER,
         };
       }
-      // Consumed before the first await, so two settlements of one authorization cannot interleave
-      // past the check.
-      this.settledAuthorizations.add(identity);
+      this.settledAuthorizations.set(identity, 'pending');
     }
-    if (this.behavior.throwOnSettle !== undefined) throw new Error(this.behavior.throwOnSettle);
+    // Releases the reservation back to available. Called on every path below except the one that
+    // ends in success, which instead moves the identity to `'consumed'`.
+    const release = (): void => {
+      if (identity !== undefined) this.settledAuthorizations.delete(identity);
+    };
+
+    if (this.behavior.throwOnSettle !== undefined) {
+      release();
+      throw new Error(this.behavior.throwOnSettle);
+    }
     if (this.behavior.rejectSettlement !== undefined) {
+      release();
       return {
         success: false,
         errorReason: this.behavior.rejectSettlement,
@@ -195,6 +225,7 @@ class FixtureExactEvmFacilitator implements SchemeNetworkFacilitator {
     }
     const problem = checkTerms(payload, requirements);
     if (problem !== undefined) {
+      release();
       return {
         success: false,
         errorReason: problem,
@@ -203,6 +234,8 @@ class FixtureExactEvmFacilitator implements SchemeNetworkFacilitator {
         payer: F.PAYER,
       };
     }
+
+    if (identity !== undefined) this.settledAuthorizations.set(identity, 'consumed');
     return {
       success: true,
       transaction: F.SETTLEMENT_TX_HASH,

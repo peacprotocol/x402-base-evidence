@@ -53,3 +53,75 @@ No byte-identical parity is claimed for any file (every "ported, semantically un
 was ported by hand, not mechanically synced), so no checksum manifest is committed. A checksum
 manifest and a local parity test belong here only when byte-identical parity is actually
 established for a specific subset of files.
+
+## Runtime/reuse decisions
+
+This repository's custom x402 term-matching, EIP-3009 settlement handling, chain-observation
+binding and offline verification are deliberately not built on top of published PEAC packages.
+This section records what was checked and why, so the decision is reproducible rather than
+assumed. Checked against `@peac/adapter-x402@0.16.4`, `@peac/rails-x402@0.16.4` and
+`@peac/adapter-core@0.16.4` (installed into a scratch directory for inspection; none of the three
+is a dependency of this repository).
+
+| This repository's need | `@peac/adapter-x402` | `@peac/rails-x402` | `@peac/adapter-core` |
+|---|---|---|---|
+| x402 v2 exact/EVM term matching against `PaymentRequirements`/`PaymentPayload` | No fit | No fit | No fit |
+| EIP-3009 authorization semantics | Partial shape overlap only | No fit | No fit |
+| Offer/receipt validation | Out of scope for this profile | No fit | No fit |
+| PEAC commerce mapping to this repository's record shape | Wrong object model | Wrong evidence model | Wrong layer for a reference example |
+| Finality guard against overstating a settlement event | No verifier-side counterpart | No fit | Equivalent guarantee, issuer-side only |
+| Evidence-sidecar binding / offline verification | Not provided | Not provided | Not provided |
+
+**`@peac/adapter-x402`.** Its entire surface — `verifyOffer`/`verifyReceipt`, `verifyOfferV2`/
+`verifyReceiptV2`, `matchAcceptTerms`/`selectAccept`, `toPeacRecord`/`toPeacRecordV2` — targets
+x402's separate **Signed Offers & Receipts extension**: a JWS-signed offer issued on every `402`
+and a JWS-signed receipt issued on every `200`, layered on top of the base protocol. This
+repository's flow never engages that extension: it observes the native x402 v2 `exact` scheme
+payment negotiation directly (`PaymentRequired` / `PaymentPayload` / `SettleResponse` over the
+`payment-required` / `payment-signature` / `payment-response` headers, an EIP-3009
+`transferWithAuthorization` payload with `from`/`to`/`value`/`validAfter`/`validBefore`/`nonce`),
+and produces no signed offer or signed receipt at any point. `matchAcceptTerms`/`selectAccept`
+compare a normalized offer's fields against an `AcceptEntry` — the Signed Offer extension's own
+term-matching shape — not against `@x402/core`'s `PaymentRequirements`/`PaymentPayload`, so they do
+not apply to this repository's `checkTerms()` (`src/flow/fixture-facilitator.ts`), which matches
+network/scheme/asset/amount/recipient directly on the upstream x402 core types. The package's `raw-v2.ts`
+does mirror the same underlying V2 transport objects this repository observes (`RawV2PaymentRequired`,
+`RawV2PaymentAuthorization`, `RawV2SettlementResponse` line up field-for-field with what
+`src/x402-header.ts` captures), which is the one real overlap — but `toPeacRecordV2`, the function
+that would turn that into a PEAC record, unconditionally requires `rawOffer: RawSignedOffer` and
+`rawReceipt: RawSignedReceipt` as parameters. This repository has neither: adopting `toPeacRecordV2`
+would mean fabricating a signed offer and a signed receipt that were never part of the payment flow
+being evidenced, solely to satisfy a function signature. The shape overlap is real; the mapper built
+on top of it targets a different artifact this profile does not produce.
+
+**`@peac/rails-x402`.** Built around a higher-level "invoice/webhook" x402 model —
+`X402Invoice`/`X402Settlement` with an ISO 4217 `currency` field, a `payTo` **routing** object
+(`mode: 'direct' | 'callback' | 'role'`), dialect auto-detection between legacy `X-PAYMENT-*`
+headers and `Payment-*` headers — with no EIP-3009 authorization concept, no exact-scheme
+settlement semantics, and no chain observation of any kind. This repository's asset is named by an
+ERC-20 **contract address**, not an ISO 4217 code (see the `currency` row in the evidence
+projection below), and its payment terms are matched structurally against an on-chain
+authorization, not routed through an invoice/webhook model. No shared surface.
+
+**`@peac/adapter-core`.** `assertExplicitFinality` (`finality.ts`) enforces exactly the invariant
+this repository's issuer already enforces by hand: a settlement `event` is recorded only when the
+observation it is built from explicitly reached that outcome, never inferred from lifecycle state
+alone (`src/flow/issue-record.ts` includes `event: 'settlement'` in the commerce group if and only
+if `chainObservation.chain_observation.settlement_outcome === 'succeeded'`). Adopting the guard
+would add a runtime dependency to re-express a conditional this repository's own code already
+states directly and legibly, without adding a property the custom code lacks: the guard is an
+issuer-side / mapper-boundary check with no verifier-side counterpart, whereas this repository's
+evidence projection (`src/flow/evidence-projection.ts`) additionally **re-derives and independently
+compares** the same claim at verification time, from the bound chain observation, against what the
+record asserts — the property that actually matters for the security argument this repository
+makes. The other two functions in `validators.ts` and the `PaymentProofAdapter` interface in
+`payment-proof.ts` target building a new, registered PEAC payment-rail adapter package
+(`profileId: "peac-x402-offer-receipt/0.1"`-shaped); this repository is a non-normative reference
+implementation that deliberately emits its own example-local record shape
+(`org.peacprotocol/payment` with the `com.example/payment_evidence` group), not a candidate for
+that interface.
+
+**Conclusion.** No dependency was added. "This code already exists in this repository" is not the
+reason; the reason is that none of the three packages' actual object models and mapper
+requirements match what this profile observes and evidences, checked field by field above rather
+than assumed from package descriptions.

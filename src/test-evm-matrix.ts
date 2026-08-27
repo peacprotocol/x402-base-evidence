@@ -71,6 +71,7 @@ import {
   observeSealedTransaction,
   TRANSFER_EVENT_TOPIC,
   transfersOnContract,
+  CHAIN_IDENTITY_UNESTABLISHED,
   type ObservedLog,
   type SealedTransactionSource,
 } from './flow/observe-transaction.ts';
@@ -506,6 +507,7 @@ const passed = (report: EvidenceVerificationReport, name: string): boolean =>
   };
   const source: SealedTransactionSource = {
     reference: 'synthetic sealed source',
+    chainId: async () => 84532n,
     sealedHeadBlockNumber: async () => 1000n,
     transactionReceipt: async () => ({
       status: 'success',
@@ -527,6 +529,7 @@ const passed = (report: EvidenceVerificationReport, name: string): boolean =>
   const observation = await observeSealedTransaction({
     source,
     transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedNetwork: F.NETWORK,
     expectedTransfer: {
       token_contract: F.ASSET_CONTRACT,
       transfer_from: F.PAYER,
@@ -675,6 +678,123 @@ recordExecution('EVM-REPLAY-001');
   );
 }
 
+/**
+ * EIP3009-REPLAY-001 through EIP3009-REPLAY-005. Only a settlement that actually succeeds may
+ * consume the authorization it settled; a refusal, a thrown error, or a term mismatch must leave
+ * it exactly as spendable as it was before the attempt, so a caller can retry it.
+ */
+console.log('\n  -- replay: only success consumes --');
+
+recordExecution('EIP3009-REPLAY-001');
+{
+  const { client } = createFixtureFacilitator(F.NETWORK, { rejectSettlement: 'insufficient_funds' });
+  const first = await client.settle(F.PAYMENT_PAYLOAD, F.PAYMENT_REQUIREMENTS);
+  const retry = await client.settle(F.PAYMENT_PAYLOAD, F.PAYMENT_REQUIREMENTS);
+  check(
+    'an explicitly refused settlement does not consume the authorization',
+    first.success === false &&
+      first.errorReason === 'insufficient_funds' &&
+      retry.success === false &&
+      retry.errorReason === 'insufficient_funds',
+    `first ${JSON.stringify(first)}, retry ${JSON.stringify(retry)}`,
+  );
+}
+
+recordExecution('EIP3009-REPLAY-002');
+{
+  // Retried on the SAME instance, not a fresh one: a fresh instance's own state proves nothing
+  // about whether `release()` actually cleared the first attempt's 'pending' entry. The injected
+  // behavior throws on every call to this instance, so if `release()` worked, a second call
+  // re-evaluates the identical (authorizer, nonce) from scratch and throws again. If it did not,
+  // the duplicate check at the top of `settle()` finds the identity still 'pending' and returns
+  // `duplicate_settlement` WITHOUT ever reaching the throwing behavior a second time -- that
+  // silent switch from "threw" to "returned a response" is exactly the failure this proves absent.
+  const { client } = createFixtureFacilitator(F.NETWORK, { throwOnSettle: 'endpoint unavailable' });
+  let firstThrew = false;
+  try {
+    await client.settle(F.PAYMENT_PAYLOAD, F.PAYMENT_REQUIREMENTS);
+  } catch {
+    firstThrew = true;
+  }
+  let secondThrew = false;
+  let secondResult: unknown;
+  try {
+    secondResult = await client.settle(F.PAYMENT_PAYLOAD, F.PAYMENT_REQUIREMENTS);
+  } catch {
+    secondThrew = true;
+  }
+  check(
+    'a settlement that throws does not consume the authorization: retrying the SAME instance throws again, never duplicate_settlement',
+    firstThrew && secondThrew && secondResult === undefined,
+    `first threw ${firstThrew}, second threw ${secondThrew}, second result ${JSON.stringify(secondResult)}`,
+  );
+}
+
+recordExecution('EIP3009-REPLAY-003');
+{
+  const { client } = createFixtureFacilitator(F.NETWORK, {});
+  const mismatchedRequirements = { ...F.PAYMENT_REQUIREMENTS, amount: '999999' };
+  const failedAttempt = await client.settle(F.PAYMENT_PAYLOAD, mismatchedRequirements);
+  const retryWithCorrectTerms = await client.settle(F.PAYMENT_PAYLOAD, F.PAYMENT_REQUIREMENTS);
+  check(
+    'a term-validation failure does not consume the authorization; a retry with correct terms succeeds',
+    failedAttempt.success === false &&
+      failedAttempt.errorReason === 'amount_mismatch' &&
+      retryWithCorrectTerms.success === true,
+    `failed ${JSON.stringify(failedAttempt)}, retry ${JSON.stringify(retryWithCorrectTerms)}`,
+  );
+}
+
+recordExecution('EIP3009-REPLAY-004');
+{
+  const { client } = createFixtureFacilitator(F.NETWORK, {});
+  const first = await client.settle(F.PAYMENT_PAYLOAD, F.PAYMENT_REQUIREMENTS);
+  const retry = await client.settle(F.PAYMENT_PAYLOAD, F.PAYMENT_REQUIREMENTS);
+  check(
+    'a settlement that succeeds consumes the authorization; a retry is refused as a duplicate',
+    first.success === true && retry.success === false && retry.errorReason === DUPLICATE_SETTLEMENT_REASON,
+    `first ${JSON.stringify(first)}, retry ${JSON.stringify(retry)}`,
+  );
+}
+
+recordExecution('EIP3009-REPLAY-005');
+{
+  const withAuthorizer = (from: string): PaymentPayload =>
+    structuredClone({
+      ...F.PAYMENT_PAYLOAD,
+      payload: { ...F.PAYMENT_PAYLOAD.payload, authorization: { ...F.EXACT_EVM_AUTHORIZATION, from } },
+    });
+  const otherAuthorizer = '0x00000000000000000000000000000000000000bb';
+
+  // The first authorizer's attempt FAILS; a different authorizer using the same nonce value must
+  // still be evaluated on its own terms.
+  const failing = createFixtureFacilitator(F.NETWORK, { rejectSettlement: 'insufficient_funds' });
+  const firstFailed = await failing.client.settle(withAuthorizer(F.PAYER), F.PAYMENT_REQUIREMENTS);
+  const otherAfterFailure = await failing.client.settle(withAuthorizer(otherAuthorizer), F.PAYMENT_REQUIREMENTS);
+  check(
+    'a different authorizer using the same nonce value is unaffected by the first one failing',
+    // Both attempts are refused under this facilitator's configured behavior either way; what
+    // this proves is that the different authorizer is evaluated on its own terms and never sees
+    // "duplicate_settlement" from the first authorizer's unrelated failure.
+    firstFailed.success === false &&
+      firstFailed.errorReason === 'insufficient_funds' &&
+      otherAfterFailure.success === false &&
+      otherAfterFailure.errorReason === 'insufficient_funds',
+    `first ${JSON.stringify(firstFailed)}, other ${JSON.stringify(otherAfterFailure)}`,
+  );
+
+  // The first authorizer's attempt SUCCEEDS (consuming its own identity); a different authorizer
+  // using the same nonce value must still be independent of that consumption.
+  const succeeding = createFixtureFacilitator(F.NETWORK, {});
+  const firstSucceeded = await succeeding.client.settle(withAuthorizer(F.PAYER), F.PAYMENT_REQUIREMENTS);
+  const otherAfterSuccess = await succeeding.client.settle(withAuthorizer(otherAuthorizer), F.PAYMENT_REQUIREMENTS);
+  check(
+    'a different authorizer using the same nonce value is unaffected by the first one consuming it',
+    firstSucceeded.success === true && otherAfterSuccess.success === true,
+    `first ${JSON.stringify(firstSucceeded)}, other ${JSON.stringify(otherAfterSuccess)}`,
+  );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Evidence: a receipt is not a payment.
 // ---------------------------------------------------------------------------------------------
@@ -698,6 +818,7 @@ recordExecution('EVM-EVIDENCE-001');
   };
   const sourceWith = (logs: readonly ObservedLog[]): SealedTransactionSource => ({
     reference: 'synthetic sealed source',
+    chainId: async () => 84532n,
     sealedHeadBlockNumber: async () => 1000n,
     transactionReceipt: async () => ({
       status: 'success',
@@ -738,6 +859,7 @@ recordExecution('EVM-EVIDENCE-001');
   const bare = await observeSealedTransaction({
     source: sourceWith([]),
     transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedNetwork: F.NETWORK,
     expectedTransfer,
     observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
   });
@@ -763,6 +885,7 @@ recordExecution('EVM-EVIDENCE-001');
   const wrongAmount = await observeSealedTransaction({
     source: sourceWith([wrongAmountLog]),
     transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedNetwork: F.NETWORK,
     expectedTransfer,
     observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
   });
@@ -792,6 +915,7 @@ recordExecution('EVM-EVIDENCE-001');
   const noInclusion = await observeSealedTransaction({
     source: disagreeing,
     transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedNetwork: F.NETWORK,
     expectedTransfer,
     observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
   });
@@ -811,6 +935,7 @@ recordExecution('EVM-EVIDENCE-001');
   const stillNoInclusion = await observeSealedTransaction({
     source: unqueryable,
     transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedNetwork: F.NETWORK,
     expectedTransfer,
     observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
   });
@@ -842,6 +967,7 @@ recordExecution('EVM-EVIDENCE-001');
   const absentFromList = await observeSealedTransaction({
     source: txAbsentFromSealedList,
     transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedNetwork: F.NETWORK,
     expectedTransfer,
     observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
   });
@@ -864,6 +990,7 @@ recordExecution('EVM-EVIDENCE-001');
   const hashDisagreement = await observeSealedTransaction({
     source: txHashDisagrees,
     transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedNetwork: F.NETWORK,
     expectedTransfer,
     observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
   });
@@ -886,6 +1013,7 @@ recordExecution('EVM-EVIDENCE-001');
   const numberDisagreement = await observeSealedTransaction({
     source: txNumberDisagrees,
     transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedNetwork: F.NETWORK,
     expectedTransfer,
     observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
   });
@@ -903,6 +1031,7 @@ recordExecution('EVM-EVIDENCE-001');
   const missingPlacement = await observeSealedTransaction({
     source: txWithoutPlacement,
     transactionHash: F.SETTLEMENT_TX_HASH,
+    expectedNetwork: F.NETWORK,
     expectedTransfer,
     observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
   });
@@ -913,6 +1042,161 @@ recordExecution('EVM-EVIDENCE-001');
       missingPlacement.receipt_status === 'success',
     `level ${String(missingPlacement.observation_level)}`,
   );
+
+  console.log('\n  -- chain identity binding --');
+
+  recordExecution('CHAIN-ID-001');
+  {
+    const wrongChain: SealedTransactionSource = { ...sourceWith([]), chainId: async () => 1n };
+    const observation = await observeSealedTransaction({
+      source: wrongChain,
+      transactionHash: F.SETTLEMENT_TX_HASH,
+      expectedTransfer,
+      expectedNetwork: F.NETWORK,
+      observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
+    });
+    check(
+      'an endpoint reporting the wrong chain id abstains rather than reporting inclusion evidence',
+      observation.observation_state === 'unavailable' &&
+        observation.observation_level === undefined &&
+        observation.receipt_status === undefined &&
+        observation.token_transfer === undefined &&
+        observation.observed_network === undefined &&
+        observation.unavailable_reason?.includes('eip155:1') === true &&
+        observation.unavailable_reason?.includes(F.NETWORK) === true,
+      JSON.stringify(observation),
+    );
+  }
+
+  recordExecution('CHAIN-ID-002');
+  {
+    // Simulates the endpoint's configured URL having been repointed between an earlier preflight
+    // (which validated Base Sepolia) and this observation: the same endpoint reference now answers
+    // Base mainnet. Nothing here reuses whatever preflight decided; this call re-asks independently
+    // and abstains on its own evidence.
+    const changedSincePreflight: SealedTransactionSource = {
+      ...sourceWith([]),
+      chainId: async () => 8453n,
+    };
+    const observation = await observeSealedTransaction({
+      source: changedSincePreflight,
+      transactionHash: F.SETTLEMENT_TX_HASH,
+      expectedTransfer,
+      expectedNetwork: F.NETWORK,
+      observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
+    });
+    check(
+      'an endpoint that now answers a different chain than an earlier preflight validated still abstains',
+      observation.observation_state === 'unavailable' &&
+        observation.unavailable_reason?.includes('eip155:8453') === true,
+      JSON.stringify(observation),
+    );
+  }
+
+  recordExecution('CHAIN-ID-003');
+  {
+    const malformedChainId: SealedTransactionSource = {
+      ...sourceWith([]),
+      chainId: async () => {
+        throw new Error('the endpoint reported no usable chain id');
+      },
+    };
+    const observation = await observeSealedTransaction({
+      source: malformedChainId,
+      transactionHash: F.SETTLEMENT_TX_HASH,
+      expectedTransfer,
+      expectedNetwork: F.NETWORK,
+      observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
+    });
+    check(
+      'a malformed or unparseable chain id abstains with a reason distinct from a chain-id mismatch',
+      observation.observation_state === 'unavailable' &&
+        observation.unavailable_reason === CHAIN_IDENTITY_UNESTABLISHED,
+      JSON.stringify(observation),
+    );
+  }
+
+  recordExecution('CHAIN-ID-004');
+  {
+    check(
+      'an endpoint correctly reporting Base Sepolia establishes the chain identity and inclusion proceeds',
+      bare.observed_network === F.NETWORK && bare.observation_level === 'l2_block_inclusion',
+      JSON.stringify({ observed_network: bare.observed_network, level: bare.observation_level }),
+    );
+  }
+
+  console.log('\n  -- ERC-20 transfer multiplicity --');
+
+  const matchingLogForMultiplicity: ObservedLog = {
+    address: F.ASSET_CONTRACT,
+    topics: [
+      TRANSFER_EVENT_TOPIC,
+      `0x${F.PAYER.slice(2).padStart(64, '0')}`,
+      `0x${F.PAY_TO.slice(2).padStart(64, '0')}`,
+    ],
+    data: `0x${BigInt(F.AMOUNT_BASE_UNITS).toString(16).padStart(64, '0')}`,
+  };
+
+  recordExecution('TRANSFER-001');
+  {
+    const oneMatch = await observeSealedTransaction({
+      source: sourceWith([matchingLogForMultiplicity]),
+      transactionHash: F.SETTLEMENT_TX_HASH,
+      expectedTransfer,
+      expectedNetwork: F.NETWORK,
+      observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
+    });
+    const oneMatchComparison = compareExpectationToObservation({
+      ...expectationSide,
+      rpc_observation: oneMatch,
+    });
+    check(
+      'exactly one matching Transfer event is recorded as a match, with the counts explicit',
+      oneMatch.matching_transfer_count === 1 &&
+        oneMatch.expected_contract_transfer_count === 1 &&
+        oneMatchComparison.transfer_event === 'match',
+      `matching ${String(oneMatch.matching_transfer_count)}, total ${String(oneMatch.expected_contract_transfer_count)}`,
+    );
+  }
+
+  recordExecution('TRANSFER-002');
+  {
+    const twoMatches = await observeSealedTransaction({
+      source: sourceWith([matchingLogForMultiplicity, matchingLogForMultiplicity]),
+      transactionHash: F.SETTLEMENT_TX_HASH,
+      expectedTransfer,
+      expectedNetwork: F.NETWORK,
+      observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
+    });
+    const twoMatchesComparison = compareExpectationToObservation({
+      ...expectationSide,
+      rpc_observation: twoMatches,
+    });
+    check(
+      'two matching Transfer events are represented by an explicit count of two, never silently resolved to one match',
+      twoMatches.matching_transfer_count === 2 &&
+        twoMatches.expected_contract_transfer_count === 2 &&
+        // Conservative: "exactly one" is what the pinned settlement path proves, so two matches is
+        // not treated as an unambiguous match either.
+        twoMatchesComparison.transfer_event !== 'match',
+      `matching ${String(twoMatches.matching_transfer_count)}, verdict ${twoMatchesComparison.transfer_event}`,
+    );
+  }
+
+  recordExecution('TRANSFER-003');
+  {
+    // `bare` (constructed with `sourceWith([])`, no logs at all) is the zero-transfers case
+    // already established earlier in this suite: a successful, sealed-included receipt with no
+    // transfer event on the expected contract at all.
+    check(
+      'zero matching Transfer events on a successful receipt is not matching payment evidence, with the zero count explicit',
+      bare.matching_transfer_count === 0 &&
+        bare.expected_contract_transfer_count === 0 &&
+        bare.receipt_status === 'success' &&
+        bareComparison.transfer_event === 'mismatch',
+      `matching ${String(bare.matching_transfer_count)}, verdict ${bareComparison.transfer_event}`,
+    );
+  }
 }
 
 // Exact ERC-20 Transfer decoding. Completes EVM-EVIDENCE-001: the structural parser accepts the
@@ -1187,8 +1471,8 @@ recordExecution('EVM-TAMPER-002');
   const tampered = encoder.encode(`${observed.slice(0, -4)}AAAA`);
   const report = await verifyWith(new Map([['artifacts/payment-signature.txt', tampered]]));
   check(
-    'a tampered observed field value fails its own digest and nothing else',
-    failedExactly(report, ['payment-signature digest']),
+    'a tampered observed field value fails its own digest and its own x402 native validation, and nothing else',
+    failedExactly(report, ['payment-signature digest', 'x402 native validation: payment-signature']),
     failedChecks(report).join(', ') || 'nothing failed',
   );
   check(
@@ -1269,7 +1553,7 @@ recordExecution('EVM-TAMPER-004');
     'an altered observation document fails its own digest and the amount the record repeats, not the native artifact',
     failedExactly(report, [
       'chain observation digest',
-      'record and observation name the same amount',
+      'evidence projection: amount_minor',
     ]) && passed(report, 'payment-response digest'),
     failedChecks(report).join(', ') || 'nothing failed',
   );

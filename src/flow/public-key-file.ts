@@ -17,16 +17,32 @@
  * a key is never guessed at: verifying under a key nobody can describe would report a result about
  * material the reader did not choose.
  */
-import { writeFileSync } from 'node:fs';
+import { isCanonicalIss } from '@peac/schema';
 import { displayKeyPath } from './key-file.ts';
 import { parseStrictJson, type StrictJsonRefusal } from '../strict-json.ts';
 import { PUBLIC_KEY_FILE_MAX_BYTES, readBoundedFile } from './safe-read.ts';
+import { writeFileDurably } from './durable-write.ts';
 
 /** The only algorithm this example issues or verifies under. */
 export const PUBLIC_KEY_ALGORITHM = 'Ed25519';
 
 /** Exactly the 32 bytes of an Ed25519 public key, as hex. */
 const PUBLIC_KEY_HEX = /^[0-9a-fA-F]{64}$/;
+
+/**
+ * The only members a key file may declare. Closed, not open: a member outside this set is refused
+ * outright rather than silently ignored, because an ignored member is one a reader of the file
+ * could easily believe this reader also checked.
+ */
+const KEY_FILE_MEMBERS = new Set(['algorithm', 'kid', 'issuer', 'publicKey', 'note']);
+
+/**
+ * The same UTF-8 byte bound PEAC's own `kid` grammar applies. Well-formedness (no unpaired
+ * surrogate) is already guaranteed by the time a string reaches here: the whole file was admitted
+ * through `parseStrictJson`, which refuses any string, key or value, that is not well-formed under
+ * RFC 7493, before this function ever inspects one.
+ */
+const MAX_KID_UTF8_BYTES = 256;
 
 export interface IssuerPublicKeyFileV1 {
   readonly algorithm: typeof PUBLIC_KEY_ALGORITHM;
@@ -77,7 +93,11 @@ export class InvalidPublicKeyFileError extends Error {
 }
 
 /**
- * Write the public half of an issuer key.
+ * Write the public half of an issuer key, durably: opened exclusively, written and `fsync`ed
+ * before the descriptor closes (see `durable-write.ts`). A crash immediately after this returns
+ * does not lose the file's bytes; the directory entry pointing at it is a separate fact, made
+ * durable by the caller's own `fsyncDirectory` on the containing directory (`prepareRunOutputs`
+ * does this immediately after calling this function, before its own gate is considered satisfied).
  *
  * @param path - Where to write. An existing file is never replaced: a run's key belongs to that
  *   run, and overwriting one would silently restate which key verifies an earlier directory.
@@ -96,7 +116,7 @@ export function writeIssuerPublicKeyFile(
       'Public key only. Verifying under it shows the record is intact; ' +
       'it does not establish who holds the private key.',
   };
-  writeFileSync(path, `${JSON.stringify(contents, null, 2)}\n`, { flag: 'wx' });
+  writeFileDurably(path, Buffer.from(`${JSON.stringify(contents, null, 2)}\n`, 'utf8'));
 }
 
 /** Why a key file was not admitted, said in the words a reader of the message needs. */
@@ -107,6 +127,8 @@ const KEY_FILE_REFUSALS: Readonly<Record<StrictJsonRefusal, string>> = {
   duplicate_member:
     'it declares the same member twice, so which key it names depends on the parser reading it',
   depth_limit_exceeded: 'it nests deeper than a key file is read',
+  invalid_ijson_string:
+    'it contains a string that is not valid under RFC 7493 (an unpaired surrogate or a Unicode noncharacter)',
 };
 
 /**
@@ -145,6 +167,17 @@ export function readIssuerPublicKeyFile(path: string): LoadedIssuerPublicKey {
     throw new InvalidPublicKeyFileError(path, 'it does not hold a key object');
   }
 
+  // Closed schema: a member outside the declared set is refused, not dropped. A silently ignored
+  // member would let a key file carry something this reader never checked while looking, to
+  // anyone reading the file itself, exactly as checked as everything beside it.
+  const unknownMembers = Object.keys(parsed).filter((key) => !KEY_FILE_MEMBERS.has(key));
+  if (unknownMembers.length > 0) {
+    throw new InvalidPublicKeyFileError(
+      path,
+      `it declares a member this reader does not recognise (${unknownMembers[0]!.slice(0, 40)})`,
+    );
+  }
+
   const file = parsed as Partial<IssuerPublicKeyFileV1>;
   if (file.algorithm !== PUBLIC_KEY_ALGORITHM) {
     throw new InvalidPublicKeyFileError(
@@ -155,8 +188,17 @@ export function readIssuerPublicKeyFile(path: string): LoadedIssuerPublicKey {
   if (typeof file.kid !== 'string' || file.kid.length === 0) {
     throw new InvalidPublicKeyFileError(path, 'it has no key identifier');
   }
-  if (typeof file.issuer !== 'string' || file.issuer.length === 0) {
-    throw new InvalidPublicKeyFileError(path, 'it names no issuer');
+  if (Buffer.byteLength(file.kid, 'utf8') > MAX_KID_UTF8_BYTES) {
+    throw new InvalidPublicKeyFileError(
+      path,
+      `its key identifier exceeds ${MAX_KID_UTF8_BYTES} UTF-8 bytes, the same bound PEAC applies to kid`,
+    );
+  }
+  if (typeof file.issuer !== 'string' || !isCanonicalIss(file.issuer)) {
+    throw new InvalidPublicKeyFileError(
+      path,
+      'its issuer is not a canonical PEAC issuer (an https://<origin> or a did:<method> identifier)',
+    );
   }
   // Checked as hex before decoding, because the decoder discards characters it does not recognise:
   // a damaged field would otherwise decode to a shorter, entirely different key.

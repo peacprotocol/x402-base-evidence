@@ -1,12 +1,13 @@
 /**
- * Validation of the two application-local binding documents against their committed schemas.
+ * Validation of this example's own application-local documents against their committed schemas.
  *
- * WHAT THIS IS, AND WHAT IT IS NOT. The schemas under `schemas/` describe the two documents this
- * example invents: an example-local request binding and an example-local origin result binding.
- * They are experimental and non-normative. Validating against them establishes that a document has
- * the shape this example produces and nothing more. It is NOT PEAC conformance, NOT x402
- * conformance, and NOT a statement about any registry: neither profile is registered anywhere, and
- * a document that validates here has satisfied one repository's own closed schema.
+ * WHAT THIS IS, AND WHAT IT IS NOT. The schemas under `schemas/` describe the documents this
+ * example invents: an example-local request binding, an example-local origin result binding, and
+ * this example's Base chain-observation document. They are experimental and non-normative.
+ * Validating against them establishes that a document has the shape this example produces and
+ * nothing more. It is NOT PEAC conformance, NOT x402 conformance, and NOT a statement about any
+ * registry: none of the three profiles is registered anywhere, and a document that validates here
+ * has satisfied one repository's own closed schema.
  *
  * WHY THE VERIFIER RUNS THEM AT ALL. A digest proves that a document is the one the record bound.
  * It says nothing about whether that document is well formed, so a producer that emitted a request
@@ -31,11 +32,12 @@ import Ajv2020 from 'ajv/dist/2020.js';
 const APP_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
 /** The example-local documents that have a committed schema. */
-export type LocalProfileDocument = 'request-binding' | 'origin-result-binding';
+export type LocalProfileDocument = 'request-binding' | 'origin-result-binding' | 'base-chain-observation';
 
 const SCHEMA_FILE: Readonly<Record<LocalProfileDocument, string>> = {
   'request-binding': 'request-binding.v1.schema.json',
   'origin-result-binding': 'origin-result-binding.v1.schema.json',
+  'base-chain-observation': 'base-chain-observation.v1.schema.json',
 };
 
 export type LocalProfileResult =
@@ -75,6 +77,7 @@ function validators(): Record<LocalProfileDocument, ValidatorWithErrors> {
   compiled = {
     'request-binding': load('request-binding'),
     'origin-result-binding': load('origin-result-binding'),
+    'base-chain-observation': load('base-chain-observation'),
   };
   return compiled;
 }

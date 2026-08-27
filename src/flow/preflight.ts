@@ -19,9 +19,9 @@
  * is recorded in the evidence as `transaction_sender`, an observed fact; no role beyond having
  * broadcast is inferred from it.
  *
- * REVIEWER MATERIAL COMES BEFORE FUNDS. The last local check proves the directory that will hold
+ * RECIPIENT MATERIAL COMES BEFORE FUNDS. The last local check proves the directory that will hold
  * the public half of the signing key is writable, before any payment is attempted, so there is no
- * state in which funds moved and the material a reviewer needs cannot be written.
+ * state in which funds moved and the material a recipient needs cannot be written.
  */
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -142,14 +142,14 @@ export function distinctRolesCheck(payTo: string, payerAddress: string): Preflig
 }
 
 /**
- * Prove the directory that will hold reviewer material is writable, before anything is spent.
+ * Prove the directory that will hold recipient material is writable, before anything is spent.
  *
  * A probe file is created exclusively, read back, and removed. Nothing else is touched: the real
  * key file for a run is written by the run itself, exclusively, so this check can never overwrite
  * or reserve anything a run will use.
  */
-export function reviewerMaterialWritableCheck(outDirectory: string = join(APP_ROOT, 'out')): PreflightCheck {
-  const name = 'reviewer key material is writable before any payment';
+export function recipientMaterialWritableCheck(outDirectory: string = join(APP_ROOT, 'out')): PreflightCheck {
+  const name = 'recipient key material is writable before any payment';
   const probe = join(outDirectory, `.write-probe-${randomBytes(6).toString('hex')}`);
   try {
     mkdirSync(outDirectory, { recursive: true });
@@ -379,7 +379,7 @@ export interface PreflightOptions {
   readonly payerKeyMode?: PayerKeyMode;
   /** Where the payer key file lives. Defaults to the test-network payer key. */
   readonly payerKeyPath?: string;
-  /** Where reviewer material will be written. Defaults to the repository `out/` directory. */
+  /** Where recipient material will be written. Defaults to the repository `out/` directory. */
   readonly outDirectory?: string;
 }
 
@@ -419,7 +419,7 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
   // decided before one is opened.
   if (options.payTo === undefined) return { ready: false, checks, payerAddress };
   checks.push(distinctRolesCheck(options.payTo, payerAddress));
-  checks.push(reviewerMaterialWritableCheck(options.outDirectory));
+  checks.push(recipientMaterialWritableCheck(options.outDirectory));
   if (checks.some((c) => c.status === 'failed')) return { ready: false, checks, payerAddress };
 
   checks.push(...(await checkChainState(payerAddress, options.asset, options.rpc)));

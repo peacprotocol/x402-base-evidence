@@ -11,17 +11,32 @@ Evidence verification: fixtures/expected-evidence
   ok    payment-required digest: sha256:86b5943e8265096a37c765b2dfa475192b840a63aeee31e048d0df0d62540ca0
   ok    payment-signature digest: sha256:5f4b92dd1fada6010447099c3f3d3b6d8ed092bc2f3aa6db95d47d7bc22975e5
   ok    payment-response digest: sha256:bf0b4a490ecb29aa8ba3f924ccb7cb12a6682bac4b346264f7e540310d4fc755
+  ok    x402 native validation: payment-required: valid under the pinned upstream x402 v2 validator
+  ok    x402 native validation: payment-signature: valid Exact/EVM scheme shape under the pinned upstream x402 v2 validator
+  ok    x402 native validation: term matching: the presented terms match an advertised accept entry
+  ok    x402 native validation: payment-response: not_evaluated: x402 v2 core defines no upstream runtime validator for SettleResponse
   ok    origin result body: sha256:5f564269ae83a2ab0cde2d8de9fed2921ffa95e67aa7fa6035884c93bce3087c
   ok    artifact presence contract: consistent with response_write_attempted
+  ok    chain observation schema: matches the example-local closed schema
   ok    chain observation local profile: org.peacprotocol.examples.payment-evidence/base-chain-observation/1
   ok    chain observation scheme: exact
   ok    expectation and observation are separately attributed: payment_expectation and chain_observation both present with their sources
+  ok    evidence projection: kind: "evidence"
+  ok    evidence projection: pillars: ["commerce"]
+  ok    evidence projection: payment_rail: "x402"
+  ok    evidence projection: network: "eip155:84532"
+  ok    evidence projection: asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+  ok    evidence projection: amount_minor: "250000"
+  ok    evidence projection: env: "test"
+  ok    evidence projection: event: "settlement"
+  ok    evidence projection: lifecycle_states: ["request_received","payment_payload_received","payment_verified","resource_exec...
+  ok    evidence projection: reference: "pay_0000000000000000000000000000f1x2"
+  ok    evidence projection: currency: issuer assertion; this evidence set does not independently establish it
+  ok    evidence projection: occurred_at: issuer assertion; this evidence set does not independently establish it
+  ok    evidence projection: jti: issuer assertion; this evidence set does not independently establish it
   ok    settlement facts match the outcome: settled, transaction recorded
   ok    expectation comparison: network=match asset=not_evaluated recipient=not_evaluated amount=not_evaluated authorization=linked transfer_event=not_evaluated
-  ok    record and observation name the same network: eip155:84532
   ok    record and observation name the same terminal state: response_write_attempted
-  ok    record and observation name the same asset: 0x036CbD53842c5426634e7929541eC2318f3dCF7e
-  ok    record and observation name the same amount: 250000
   ok    record and observation name the same settlement response digest: sha256:bf0b4a490ecb29aa8ba3f924ccb7cb12a6682bac4b346264f7e540310d4fc755
   ok    result binding and observation name the same origin result digest: sha256:5f564269ae83a2ab0cde2d8de9fed2921ffa95e67aa7fa6035884c93bce3087c
 

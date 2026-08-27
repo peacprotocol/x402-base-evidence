@@ -155,6 +155,12 @@ pnpm test:negative                # rejection corpus
 pnpm test:ledger-integrity       # proves stale ledger state cannot mask an omitted case
 pnpm test:flow                   # offline end-to-end flow (also run under plain node)
 pnpm test:evm                    # security, replay, evidence, binding and tamper matrix
+pnpm test:projection             # the evidence projection against real, re-signed hostile records
+pnpm test:terminal                # terminal-safe rendering, the closed public key file schema
+pnpm test:rpc                    # the JSON-RPC transport boundary against a hostile endpoint
+pnpm test:durability             # crash-durability at each fsync/rename/publish boundary
+pnpm test:chain-schema           # the closed application schema for the chain-observation document
+pnpm test:x402-revalidation      # x402 native validation kept distinct from artifact integrity
 pnpm test:acceptance             # every declared acceptance case executed
 pnpm typecheck                   # TypeScript 7, primary
 pnpm typecheck:compat            # TypeScript 6, compatibility gate
@@ -344,7 +350,7 @@ is what actually prevents it from masking an omitted case, and fails if that sto
 | RFC 8259 (JSON) | Base grammar; `JSON.parse` silently keeps the last duplicate member, which is exactly why the I-JSON discipline above exists. |
 | CAIP-2 | Network identifier form (`eip155:84532` for Base Sepolia), declared as an explicit local constant; the pinned upstream default-asset registry is checked to key an entry under it. |
 | EIP-3009 | `transferWithAuthorization`, the exact-scheme payload this profile validates for EVM. |
-| JSON Schema 2020-12 | Both binding documents validate against closed schemas in `schemas/`. |
+| JSON Schema 2020-12 | The two binding documents and the chain-observation document each validate against closed, application/profile schemas in `schemas/` — none of the three is a PEAC normative schema. |
 
 The `$id` values in `schemas/*.schema.json` are namespace identifiers; they are not guaranteed to
 be dereferenceable (each schema file says so directly via `$comment`).
@@ -359,7 +365,7 @@ separately.
 | `@x402/core` / `@x402/evm` / `@x402/express` / `@x402/extensions` | `2.23.0`, exact |
 | `@peac/crypto` / `@peac/kernel` / `@peac/protocol` / `@peac/schema` | `0.16.4`, exact (current published PEAC release) |
 | TypeScript | `7.0.2` primary; `6.0.2` (`@typescript/typescript6`) compatibility gate |
-| Node.js | `^22.13.0 \|\| ^24.0.0` (CI matrix: 22, 24) |
+| Node.js | `^22.13.0 \|\| ^24.0.0` (CI matrix: floor 22.13.0, primary 24.20.0, canary 26.8.1 non-blocking) |
 | pnpm | `11.23.0`, pinned by `packageManager` including its integrity hash |
 | ajv | `8.20.0` (JSON Schema 2020-12) |
 

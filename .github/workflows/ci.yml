@@ -17,7 +17,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['22', '24']
+        # Floor 22.13.0 (the `engines.node` minimum, blocking) / primary 24.20.0 (the release
+        # baseline, blocking) / canary 26.8.1 (Node Current, non-blocking: `continue-on-error`
+        # below so a canary-only regression is visible without failing required checks). The
+        # floor is never raised here independently of `engines.node` in package.json.
+        node: ['22.13.0', '24.20.0', '26.8.1']
+    # Node 26 is a forward-compatibility canary, not yet a supported baseline: a failure on that
+    # leg alone must not block merges. `fail-fast: false` above keeps the other legs running
+    # regardless, which this only adds to for the canary leg's own reported status.
+    continue-on-error: ${{ matrix.node == '26.8.1' }}
     steps:
       # Actions are pinned to immutable commit SHAs. A tag can be moved; a SHA cannot.
       - name: Checkout
@@ -72,8 +80,10 @@ jobs:
     env:
       # The runtime for the no-network gate, pinned by digest for the same reason the actions above
       # are pinned by commit SHA: a tag can be repointed, a digest cannot. This is the multi-platform
-      # index digest of the node:24 tag, which is Node 24.19.0 at the time of pinning.
-      OFFLINE_NODE_IMAGE: 'node:24@sha256:934240a162082fd8b8a2f90cd5114446443f1eba1c5378f6687167ca405e6584'
+      # index digest of the node:24 tag, refreshed and verified live against the registry API
+      # (registry-1.docker.io); nodejs.org lists 24.20.0 as the current Node 24 LTS release as of
+      # this refresh.
+      OFFLINE_NODE_IMAGE: 'node:24@sha256:4196d66a565c6f195728d9952f161f4adfe2ad753052a08b7ec7f1c5a6bda42b'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -83,7 +93,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '24'
+          node-version: '24.20.0'
           package-manager-cache: false
 
       - name: Enable pnpm from the packageManager pin
@@ -128,7 +138,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '24'
+          node-version: '24.20.0'
           package-manager-cache: false
 
       - name: Enable pnpm from the packageManager pin

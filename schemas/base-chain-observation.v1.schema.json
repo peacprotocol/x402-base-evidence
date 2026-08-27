@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://peacprotocol.org/examples/payment-evidence/base-chain-observation/1",
+  "$comment": "$id is a namespace identifier, not a retrieval promise: this URL is not guaranteed to be dereferenceable. This is an APPLICATION/PROFILE schema for this example's own chain-observation document. It is not a PEAC normative schema, not registered anywhere, and satisfying it is not PEAC conformance or x402 conformance. Closed enums here (terminal_state, settlement_failure_reason) mirror src/flow/lifecycle.ts TERMINAL_STATES and src/flow/failure-vocabulary.ts FAILURE_REASONS at the time this file was written and must be kept in sync by hand if either changes.",
+  "title": "Payment-evidence example Base chain observation (non-normative)",
+  "description": "Closed structural shape for the chain-observation.json sidecar this example writes and reads. Validated BEFORE any verifier logic interprets the document, so a malformed or unexpectedly shaped observation is refused at the door rather than partially trusted by whichever field a later check happens to read.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profile", "scheme", "payment_expectation", "chain_observation", "comparison", "terminal_state", "observed_at_unix_seconds"],
+  "properties": {
+    "profile": { "const": "org.peacprotocol.examples.payment-evidence/base-chain-observation/1" },
+    "scheme": { "const": "exact", "description": "The only x402 scheme this example observes." },
+    "payment_expectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "network", "asset", "amount_base_units", "asset_decimals", "recipient"],
+      "properties": {
+        "source": { "const": "native_x402_artifact" },
+        "network": { "type": "string", "pattern": "^eip155:[1-9][0-9]*$", "description": "CAIP-2, EVM namespace only; no leading zero in the chain id." },
+        "asset": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
+        "amount_base_units": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$", "maxLength": 78, "description": "Canonical decimal string; 78 digits bounds a uint256." },
+        "asset_decimals": { "type": "integer", "minimum": 0, "maximum": 255, "description": "ERC-20 decimals() returns uint8." },
+        "recipient": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
+        "payer": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
+        "authorization_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "chain_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "settlement_outcome", "observed_at_unix_seconds"],
+      "properties": {
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reference"],
+          "properties": {
+            "kind": { "enum": ["facilitator", "in_process_fixture"] },
+            "reference": { "type": "string", "maxLength": 256 }
+          }
+        },
+        "settlement_outcome": { "enum": ["succeeded", "refused", "not_reached"] },
+        "transaction_hash": { "type": "string", "pattern": "^0x[0-9a-fA-F]{64}$" },
+        "network_reported": { "type": "string", "pattern": "^eip155:[1-9][0-9]*$" },
+        "payer_reported": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
+        "observed_at_unix_seconds": { "type": "integer", "minimum": 0, "maximum": 4102444800 }
+      }
+    },
+    "rpc_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "transaction_hash", "observation_state", "observed_at_unix_seconds", "statement"],
+      "properties": {
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reference"],
+          "properties": {
+            "kind": { "const": "rpc" },
+            "reference": { "type": "string", "maxLength": 256 }
+          }
+        },
+        "transaction_hash": { "type": "string", "pattern": "^0x[0-9a-fA-F]{64}$" },
+        "observation_state": { "enum": ["found", "not_found", "unavailable"] },
+        "observed_network": { "type": "string", "pattern": "^eip155:[1-9][0-9]*$" },
+        "observation_level": { "const": "l2_block_inclusion" },
+        "receipt_status": { "enum": ["success", "reverted"] },
+        "transaction_sender": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
+        "block_number": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$", "maxLength": 32 },
+        "block_hash": { "type": "string", "pattern": "^0x[0-9a-fA-F]{64}$" },
+        "token_transfer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["token_contract", "transfer_from", "transfer_to", "transfer_amount"],
+          "properties": {
+            "token_contract": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
+            "transfer_from": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
+            "transfer_to": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
+            "transfer_amount": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$", "maxLength": 78 }
+          }
+        },
+        "expected_contract_transfer_count": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "matching_transfer_count": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "unavailable_reason": { "type": "string", "maxLength": 512 },
+        "observed_at_unix_seconds": { "type": "integer", "minimum": 0, "maximum": 4102444800 },
+        "statement": { "type": "string", "maxLength": 2048 }
+      }
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network", "asset", "recipient", "amount", "authorization", "transfer_event"],
+      "properties": {
+        "network": { "enum": ["match", "mismatch", "not_evaluated"] },
+        "asset": { "enum": ["match", "mismatch", "not_evaluated"] },
+        "recipient": { "enum": ["match", "mismatch", "not_evaluated"] },
+        "amount": { "enum": ["match", "mismatch", "not_evaluated"] },
+        "authorization": { "enum": ["linked", "not_evaluated"] },
+        "transfer_event": { "enum": ["match", "mismatch", "not_evaluated"] }
+      }
+    },
+    "terminal_state": {
+      "enum": [
+        "response_write_attempted",
+        "payment_rejected_pre_verification",
+        "verification_rejected",
+        "handler_error_status",
+        "settlement_failed",
+        "payment_required_only"
+      ]
+    },
+    "settlement_failure_reason": {
+      "enum": [
+        "verification_rejected",
+        "verification_exception",
+        "settlement_rejected",
+        "settlement_exception",
+        "handler_failed",
+        "duplicate_settlement",
+        "network_mismatch",
+        "scheme_mismatch",
+        "asset_mismatch",
+        "amount_mismatch",
+        "recipient_mismatch",
+        "missing_authorization"
+      ]
+    },
+    "settlement_response_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "service_result_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "observed_at_unix_seconds": { "type": "integer", "minimum": 0, "maximum": 4102444800 }
+  }
+}
