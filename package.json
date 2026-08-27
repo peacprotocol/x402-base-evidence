@@ -24,7 +24,7 @@
     "test:negative": "tsx src/test-negative.ts",
     "test:ledger-integrity": "tsx src/test-ledger-integrity.ts",
     "test:flow": "tsx src/flow/fixture-e2e.ts",
-    "test:flow:node": "node src/flow/fixture-e2e.ts",
+    "test:flow:node": "node --experimental-strip-types src/flow/fixture-e2e.ts",
     "test:evm": "tsx src/test-evm-matrix.ts",
     "test:projection": "tsx src/test-evidence-projection.ts",
     "test:terminal": "tsx src/test-terminal-safe.ts",
