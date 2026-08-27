@@ -32,6 +32,15 @@
  * The transaction source is an interface so a test can supply one without a socket. Only the live
  * run ever constructs the JSON-RPC-backed implementation.
  */
+import {
+  ADDRESS20,
+  HASH32,
+  JSON_RPC_FAILURE_TEXT,
+  JsonRpcFailure,
+  RPC_DATA,
+  admitRpcQuantity,
+  jsonRpcRequest,
+} from './evm-json-rpc.ts';
 
 /** A raw log entry as an endpoint reports it, before any interpretation. */
 export interface ObservedLog {
@@ -147,11 +156,8 @@ export interface SealedRpcObservationV1 {
 export const TRANSFER_EVENT_TOPIC =
   '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
-/** A 0x-prefixed sequence of hex digits, the only shape a hex quantity or address arrives in. */
-const HEX_VALUE = /^0x[0-9a-fA-F]*$/;
-
-/** Exactly one 20-byte hex address. */
-const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+/** Exactly one 20-byte hex address. The RPC Data shape, shared with the JSON-RPC admissions. */
+const HEX_ADDRESS = ADDRESS20;
 
 /**
  * A 32-byte ABI word holding an indexed address: 12 zero bytes of padding, then the 20 address
@@ -233,11 +239,47 @@ export function transferMatchesExpected(
 /**
  * Fixed reasons. An endpoint's own message is never retained: it can embed anything.
  *
- * The first is exported because the preflight reports the same condition about the same kind of
- * endpoint, and two wordings for one outcome would read as two different outcomes.
+ * The endpoint-failure reasons are the bounded JSON-RPC failure vocabulary, one wording per
+ * condition everywhere it is reported: unreachable or timed out, answered with an RPC error, or
+ * answered with something structurally unusable. `ENDPOINT_UNREACHABLE` is exported because the
+ * preflight reports the same condition about the same kind of endpoint, and two wordings for one
+ * outcome would read as two different outcomes. The final reason below is local: a transaction
+ * reference that is not a 32-byte hash is refused before any endpoint is queried, because a
+ * malformed reference can select nothing and querying with it would only launder the refusal into
+ * an endpoint answer.
  */
-export const ENDPOINT_UNREACHABLE = 'the endpoint could not be reached or did not answer in time';
+export const ENDPOINT_UNREACHABLE = JSON_RPC_FAILURE_TEXT.unreachable;
+export const ENDPOINT_TEMPORARILY_UNAVAILABLE = JSON_RPC_FAILURE_TEXT.temporarily_unavailable;
+export const ENDPOINT_RPC_ERROR = JSON_RPC_FAILURE_TEXT.rpc_error;
+export const ENDPOINT_RESPONSE_UNUSABLE = JSON_RPC_FAILURE_TEXT.unusable;
 const UNKNOWN_TRANSACTION = 'the endpoint reported no receipt and no transaction for this hash';
+export const MALFORMED_TRANSACTION_REFERENCE =
+  'the transaction reference is not a 32-byte transaction hash, so no endpoint was queried';
+/**
+ * A failure this code raised locally, outside the classified JSON-RPC vocabulary. Terminal: a
+ * local error is deterministic from the loop's point of view, and retrying it would rerun the
+ * same defect while attributing the delay to the endpoint.
+ */
+export const OBSERVATION_LOCAL_FAILURE =
+  'the observation failed locally before a usable endpoint answer';
+
+/**
+ * The unavailable-reasons a bounded observation loop may retry, fail-closed.
+ *
+ * Exactly the retryable JSON-RPC failure kinds: a transport-level failure and the explicitly
+ * admitted temporary HTTP statuses. An RPC error, a structurally unusable response, a malformed
+ * transaction reference and a local failure are terminal, and an unavailable-reason outside this
+ * set is treated as terminal rather than retried on the strength of being unrecognized.
+ */
+export const RETRYABLE_UNAVAILABLE_REASONS: ReadonlySet<string> = new Set([
+  ENDPOINT_UNREACHABLE,
+  ENDPOINT_TEMPORARILY_UNAVAILABLE,
+]);
+
+/** The bounded reason for one caught observation failure. Never text a remote party supplied. */
+function reasonFor(e: unknown): string {
+  return e instanceof JsonRpcFailure ? JSON_RPC_FAILURE_TEXT[e.kind] : OBSERVATION_LOCAL_FAILURE;
+}
 
 function isoOf(observedAtUnixSeconds: number): string {
   return new Date(observedAtUnixSeconds * 1000).toISOString();
@@ -276,13 +318,21 @@ export async function observeSealedTransaction(input: {
       `at time ${at}: ${reason}.`,
   });
 
+  // The transaction reference arrives from the facilitator's settlement response, which is remote
+  // input. It is admitted as exactly one 32-byte hash BEFORE any endpoint is queried: a malformed
+  // reference selects nothing, and an observation made with it could only misattribute the
+  // refusal to the endpoint.
+  if (!HASH32.test(transactionHash)) {
+    return unavailable(MALFORMED_TRANSACTION_REFERENCE);
+  }
+
   let receipt: ObservedReceipt | undefined;
   let transaction: ObservedTransaction | undefined;
   try {
     receipt = await source.transactionReceipt(transactionHash);
     transaction = await source.transactionByHash(transactionHash);
-  } catch {
-    return unavailable(ENDPOINT_UNREACHABLE);
+  } catch (e) {
+    return unavailable(reasonFor(e));
   }
 
   if (receipt === undefined && transaction === undefined) {
@@ -433,109 +483,231 @@ export function publicEndpointReference(
   return url.origin;
 }
 
-/** One JSON-RPC call, under a deadline, returning `undefined` for any failure. */
-async function rpcCall(
-  rpcUrl: string,
-  method: string,
-  params: readonly unknown[],
-  timeoutMs: number,
-): Promise<unknown> {
-  const response = await fetch(rpcUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!response.ok) throw new Error(`rpc status ${response.status}`);
-  const body = (await response.json()) as { result?: unknown; error?: unknown };
-  if (body.error !== undefined) throw new Error('rpc error');
-  return body.result;
+/**
+ * The most receipt logs this observer will read.
+ *
+ * A deliberate bound, and a fail-closed one: a receipt reporting more logs than this is refused
+ * whole rather than truncated, because a truncated log list can silently drop the very Transfer
+ * event a match depends on and turn "not read" into a false "expected transfer absent".
+ */
+export const MAX_RECEIPT_LOGS = 256;
+
+/**
+ * Admit an `eth_getTransactionReceipt` result, or refuse the response as unusable.
+ *
+ * Exported for the offline suites, which exercise these admissions without a socket. Every field
+ * is held to its actual RPC type: `status` to the two documented values, block placement to a
+ * strict Quantity and a 32-byte hash (both may be null together for a pending placement), and
+ * every log to a 20-byte address, 32-byte topics and even-byte data. A receipt that reports more
+ * than `MAX_RECEIPT_LOGS` logs, or one malformed log, is refused WHOLE: logs are never silently
+ * skipped or truncated, because an incomplete log list cannot support any claim about which
+ * events the transaction did or did not emit.
+ *
+ * LOG PLACEMENT FIELDS ARE CHECKED WHEN PRESENT, NEVER REQUIRED. The live Base Sepolia endpoint
+ * (measured 2026-08-27) reports `removed`, `transactionHash`, `blockHash` and `blockNumber` on
+ * every receipt log; the EIP-1474 log object marks them optional, so their absence is admitted.
+ * When present each must be well-formed and must agree with the receipt this claim rests on: a
+ * log carrying `removed: true` can never satisfy the expected transfer — a removed log inside a
+ * receipt queried for a sealed claim is an inconsistent response, and the receipt is refused
+ * whole rather than read around — and a log whose placement names a different transaction or
+ * block than the receipt's own is the same inconsistency.
+ *
+ * @param result - The raw `eth_getTransactionReceipt` result.
+ * @param expectedTransactionHash - When supplied, a log's `transactionHash` (if present) must
+ *   name this transaction; the receipt is refused whole otherwise.
+ * @throws JsonRpcFailure `unusable` when the result is not an admissible receipt.
+ */
+export function admitReceiptResult(result: unknown, expectedTransactionHash?: string): ObservedReceipt {
+  if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+    throw new JsonRpcFailure('unusable');
+  }
+  const receipt = result as { status?: unknown; blockNumber?: unknown; blockHash?: unknown; logs?: unknown };
+  // The status field is documented as 0x1 success and 0x0 failure; anything else is a receipt
+  // this observer does not understand and refuses to reinterpret.
+  const status =
+    receipt.status === '0x1' ? ('success' as const) : receipt.status === '0x0' ? ('reverted' as const) : undefined;
+  if (status === undefined) throw new JsonRpcFailure('unusable');
+
+  let blockNumber: bigint | null = null;
+  if (receipt.blockNumber !== null && receipt.blockNumber !== undefined) {
+    const admitted = admitRpcQuantity(receipt.blockNumber);
+    if (admitted === undefined) throw new JsonRpcFailure('unusable');
+    blockNumber = admitted;
+  }
+  let blockHash: string | null = null;
+  if (receipt.blockHash !== null && receipt.blockHash !== undefined) {
+    if (typeof receipt.blockHash !== 'string' || !HASH32.test(receipt.blockHash)) {
+      throw new JsonRpcFailure('unusable');
+    }
+    blockHash = receipt.blockHash;
+  }
+
+  if (!Array.isArray(receipt.logs)) throw new JsonRpcFailure('unusable');
+  if (receipt.logs.length > MAX_RECEIPT_LOGS) throw new JsonRpcFailure('unusable');
+  const logs: ObservedLog[] = [];
+  for (const raw of receipt.logs) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new JsonRpcFailure('unusable');
+    }
+    const log = raw as {
+      address?: unknown;
+      topics?: unknown;
+      data?: unknown;
+      removed?: unknown;
+      transactionHash?: unknown;
+      blockHash?: unknown;
+      blockNumber?: unknown;
+    };
+    if (typeof log.address !== 'string' || !ADDRESS20.test(log.address)) {
+      throw new JsonRpcFailure('unusable');
+    }
+    if (!Array.isArray(log.topics) || !log.topics.every((t) => typeof t === 'string' && HASH32.test(t))) {
+      throw new JsonRpcFailure('unusable');
+    }
+    if (typeof log.data !== 'string' || !RPC_DATA.test(log.data)) {
+      throw new JsonRpcFailure('unusable');
+    }
+    // Placement fields: optional per EIP-1474, checked when the endpoint reports them. A log
+    // marked removed, or placed in a different transaction or block than the receipt it arrived
+    // in, makes the whole response inconsistent for the claim it exists to support.
+    if (log.removed !== undefined) {
+      if (typeof log.removed !== 'boolean') throw new JsonRpcFailure('unusable');
+      if (log.removed) throw new JsonRpcFailure('unusable');
+    }
+    if (log.transactionHash !== undefined) {
+      if (typeof log.transactionHash !== 'string' || !HASH32.test(log.transactionHash)) {
+        throw new JsonRpcFailure('unusable');
+      }
+      if (
+        expectedTransactionHash !== undefined &&
+        log.transactionHash.toLowerCase() !== expectedTransactionHash.toLowerCase()
+      ) {
+        throw new JsonRpcFailure('unusable');
+      }
+    }
+    if (log.blockHash !== undefined) {
+      if (typeof log.blockHash !== 'string' || !HASH32.test(log.blockHash)) {
+        throw new JsonRpcFailure('unusable');
+      }
+      if (blockHash !== null && log.blockHash.toLowerCase() !== blockHash.toLowerCase()) {
+        throw new JsonRpcFailure('unusable');
+      }
+    }
+    if (log.blockNumber !== undefined && log.blockNumber !== null) {
+      const logBlockNumber = admitRpcQuantity(log.blockNumber);
+      if (logBlockNumber === undefined) throw new JsonRpcFailure('unusable');
+      if (blockNumber !== null && logBlockNumber !== blockNumber) {
+        throw new JsonRpcFailure('unusable');
+      }
+    }
+    logs.push({ address: log.address, topics: log.topics as string[], data: log.data });
+  }
+  return { status, blockNumber, blockHash, logs };
 }
 
-const hexQuantity = (value: unknown): bigint | null =>
-  typeof value === 'string' && HEX_VALUE.test(value) && value.length > 2 ? BigInt(value) : null;
+/**
+ * Admit an `eth_getTransactionByHash` result, or refuse the response as unusable.
+ *
+ * @throws JsonRpcFailure `unusable` when the result is not an admissible transaction object.
+ */
+export function admitTransactionResult(result: unknown): ObservedTransaction {
+  if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+    throw new JsonRpcFailure('unusable');
+  }
+  const transaction = result as { from?: unknown; blockNumber?: unknown; blockHash?: unknown };
+  if (typeof transaction.from !== 'string' || !ADDRESS20.test(transaction.from)) {
+    throw new JsonRpcFailure('unusable');
+  }
+  let blockNumber: bigint | null = null;
+  if (transaction.blockNumber !== null && transaction.blockNumber !== undefined) {
+    const admitted = admitRpcQuantity(transaction.blockNumber);
+    if (admitted === undefined) throw new JsonRpcFailure('unusable');
+    blockNumber = admitted;
+  }
+  let blockHash: string | null = null;
+  if (transaction.blockHash !== null && transaction.blockHash !== undefined) {
+    if (typeof transaction.blockHash !== 'string' || !HASH32.test(transaction.blockHash)) {
+      throw new JsonRpcFailure('unusable');
+    }
+    blockHash = transaction.blockHash;
+  }
+  return { from: transaction.from, blockNumber, blockHash };
+}
+
+/**
+ * Admit an `eth_getBlockByNumber(..., false)` result, or refuse the response as unusable.
+ *
+ * `transactions` must be an array in which EVERY entry is a 32-byte transaction hash. A malformed
+ * entry is never silently dropped: the list exists to answer whether the sealed block contains a
+ * given transaction, and a list with an unreadable member cannot answer that for any transaction,
+ * so the whole response is refused for the inclusion claim it would otherwise support.
+ *
+ * @throws JsonRpcFailure `unusable` when the result is not an admissible block.
+ */
+export function admitSealedBlockResult(result: unknown): SealedBlock {
+  if (typeof result !== 'object' || result === null || Array.isArray(result)) {
+    throw new JsonRpcFailure('unusable');
+  }
+  const block = result as { number?: unknown; hash?: unknown; transactions?: unknown };
+  const number = admitRpcQuantity(block.number);
+  if (number === undefined) throw new JsonRpcFailure('unusable');
+  if (typeof block.hash !== 'string' || !HASH32.test(block.hash)) {
+    throw new JsonRpcFailure('unusable');
+  }
+  if (!Array.isArray(block.transactions)) throw new JsonRpcFailure('unusable');
+  const transactionHashes: string[] = [];
+  for (const entry of block.transactions) {
+    if (typeof entry !== 'string' || !HASH32.test(entry)) throw new JsonRpcFailure('unusable');
+    transactionHashes.push(entry);
+  }
+  return { number, hash: block.hash, transactionHashes };
+}
 
 /**
  * A sealed transaction source backed by a Base JSON-RPC endpoint.
  *
- * Constructed only by the live run. Block data is queried by `eth_blockNumber` and by explicit
- * block number through `eth_getBlockByNumber`; the `pending` block tag appears nowhere in this
- * implementation, because preconfirmation state cannot establish sealed inclusion.
+ * Constructed only by the live run. Every exchange goes through the strict JSON-RPC envelope
+ * reader, which THROWS a classified `JsonRpcFailure` for any failure — it does not return
+ * `undefined` to mean one — and every result is admitted against the shape its RPC type defines
+ * before it is interpreted. `undefined` from the transaction and receipt queries means exactly
+ * one thing: the endpoint answered `null`, its well-formed way of reporting no such object.
+ *
+ * Block data is queried by `eth_blockNumber` and by explicit block number through
+ * `eth_getBlockByNumber`; the `pending` block tag appears nowhere in this implementation, because
+ * preconfirmation state cannot establish sealed inclusion.
  */
 export function baseSealedRpcSource(rpcUrl: string, timeoutMs = 10_000): SealedTransactionSource {
   return {
     reference: publicEndpointReference(rpcUrl) ?? 'the configured Base RPC endpoint',
     async sealedHeadBlockNumber(): Promise<bigint> {
-      const head = hexQuantity(await rpcCall(rpcUrl, 'eth_blockNumber', [], timeoutMs));
-      if (head === null) throw new Error('the endpoint reported no usable head block number');
+      const head = admitRpcQuantity(await jsonRpcRequest(rpcUrl, 'eth_blockNumber', [], timeoutMs));
+      if (head === undefined) throw new JsonRpcFailure('unusable');
       return head;
     },
     async transactionReceipt(transactionHash: string): Promise<ObservedReceipt | undefined> {
-      const result = await rpcCall(rpcUrl, 'eth_getTransactionReceipt', [transactionHash], timeoutMs);
-      if (result === null || result === undefined) return undefined;
-      const receipt = result as {
-        status?: unknown;
-        blockNumber?: unknown;
-        blockHash?: unknown;
-        logs?: unknown;
-      };
-      // The status field is documented as 0x1 success and 0x0 failure; anything else is a receipt
-      // this observer does not understand and refuses to reinterpret.
-      const status =
-        receipt.status === '0x1' ? 'success' : receipt.status === '0x0' ? 'reverted' : undefined;
-      if (status === undefined) return undefined;
-      const logs: ObservedLog[] = [];
-      if (Array.isArray(receipt.logs)) {
-        for (const raw of receipt.logs.slice(0, 256)) {
-          const log = raw as { address?: unknown; topics?: unknown; data?: unknown };
-          if (
-            typeof log.address === 'string' &&
-            Array.isArray(log.topics) &&
-            log.topics.every((t) => typeof t === 'string') &&
-            typeof log.data === 'string'
-          ) {
-            logs.push({ address: log.address, topics: log.topics as string[], data: log.data });
-          }
-        }
-      }
-      return {
-        status,
-        blockNumber: hexQuantity(receipt.blockNumber),
-        blockHash: typeof receipt.blockHash === 'string' ? receipt.blockHash : null,
-        logs,
-      };
+      if (!HASH32.test(transactionHash)) throw new JsonRpcFailure('unusable');
+      const result = await jsonRpcRequest(rpcUrl, 'eth_getTransactionReceipt', [transactionHash], timeoutMs);
+      if (result === null) return undefined;
+      return admitReceiptResult(result, transactionHash);
     },
     async transactionByHash(transactionHash: string): Promise<ObservedTransaction | undefined> {
-      const result = await rpcCall(rpcUrl, 'eth_getTransactionByHash', [transactionHash], timeoutMs);
-      if (result === null || result === undefined) return undefined;
-      const transaction = result as { from?: unknown; blockNumber?: unknown; blockHash?: unknown };
-      if (typeof transaction.from !== 'string') return undefined;
-      return {
-        from: transaction.from,
-        blockNumber: hexQuantity(transaction.blockNumber),
-        blockHash: typeof transaction.blockHash === 'string' ? transaction.blockHash : null,
-      };
+      if (!HASH32.test(transactionHash)) throw new JsonRpcFailure('unusable');
+      const result = await jsonRpcRequest(rpcUrl, 'eth_getTransactionByHash', [transactionHash], timeoutMs);
+      if (result === null) return undefined;
+      return admitTransactionResult(result);
     },
     async sealedBlockByNumber(blockNumber: bigint): Promise<SealedBlock | undefined> {
       // Asked with `false`, so `transactions` is the list of transaction hashes. That list is
       // parsed and retained because sealed inclusion requires the sealed block to actually
       // contain the transaction, not merely to carry the number and hash the receipt reported.
-      const result = await rpcCall(
+      const result = await jsonRpcRequest(
         rpcUrl,
         'eth_getBlockByNumber',
         [`0x${blockNumber.toString(16)}`, false],
         timeoutMs,
       );
-      if (result === null || result === undefined) return undefined;
-      const block = result as { number?: unknown; hash?: unknown; transactions?: unknown };
-      const number = hexQuantity(block.number);
-      if (number === null || typeof block.hash !== 'string') return undefined;
-      if (!Array.isArray(block.transactions)) return undefined;
-      const transactionHashes: string[] = [];
-      for (const entry of block.transactions) {
-        if (typeof entry === 'string') transactionHashes.push(entry);
-      }
-      return { number, hash: block.hash, transactionHashes };
+      if (result === null) return undefined;
+      return admitSealedBlockResult(result);
     },
   };
 }

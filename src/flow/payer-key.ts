@@ -85,8 +85,10 @@ export function loadPayerAccount(path: string = PAYER_KEY_PATH): PrivateKeyAccou
   try {
     // Rejects a value outside the curve order, so a damaged field cannot load as a working key.
     return privateKeyToAccount(key.privateKeyHex as `0x${string}`);
-  } catch (e) {
-    refuseKeyFile(path, `it is not a usable key (${(e as Error).message.split('\n')[0]})`);
+  } catch {
+    // The library's message is not echoed: this diagnostic surfaces in command output, and fixed
+    // prose says everything a reader can act on about a key file that must not be quoted anyway.
+    refuseKeyFile(path, 'it is not a usable key: the curve library refused the private key');
   }
 }
 

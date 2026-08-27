@@ -67,9 +67,13 @@ const FIXTURE_ISSUER_PRIVATE_KEY = Uint8Array.from(
 export const FIXTURE_ISSUER = 'https://origin.example.test';
 export const FIXTURE_KID = 'base-payment-evidence-fixture-key-1';
 
-/** The issuer identity used by a live run. Overridable so a real deployment names itself. */
+/**
+ * The issuer identity a live run claims. REQUIRED in live mode, with no default: the issuer is
+ * the identity the operator's records claim, and no fictional or project-owned fallback may
+ * stand in for it. A live run without an explicit issuer stops before any key is created and
+ * before any payment is attemptable. The fixture issuer above belongs to the fixture mode only.
+ */
 export const LIVE_ISSUER_ENV = 'PEAC_EXAMPLE_ISSUER';
-const DEFAULT_LIVE_ISSUER = 'https://origin.example.test';
 
 interface StoredIssuerKey {
   readonly note: string;
@@ -88,7 +92,7 @@ export class IssuerConfigurationError extends Error {
     super(
       `The configured issuer cannot be used: ${reason}\n` +
         `  Set ${LIVE_ISSUER_ENV} to an absolute http or https URL naming the party that issues ` +
-        'these records, or leave it unset to use the default.',
+        'these records. A live run has no default issuer.',
     );
     this.name = 'IssuerConfigurationError';
   }
@@ -150,9 +154,32 @@ export function assertUsableIssuer(value: string): string {
   return value;
 }
 
-/** The issuer a live run claims, taken from the environment and checked before it is used. */
+/**
+ * The issuer a live run claims, taken from the environment and checked before it is used.
+ *
+ * FAILS CLOSED when the variable is unset: live mode has no default issuer, so an unconfigured
+ * run stops here — before any key file is opened or created — rather than signing records that
+ * claim an identity nobody configured.
+ */
 function configuredLiveIssuer(): string {
-  return assertUsableIssuer(process.env[LIVE_ISSUER_ENV] ?? DEFAULT_LIVE_ISSUER);
+  const configured = process.env[LIVE_ISSUER_ENV];
+  if (configured === undefined) {
+    throw new IssuerConfigurationError(`${LIVE_ISSUER_ENV} is not set, and live mode has no default issuer`);
+  }
+  return assertUsableIssuer(configured);
+}
+
+/**
+ * The issuer an existing key file records, without creating anything.
+ *
+ * For readiness checks that must be able to report a binding mismatch BEFORE a run starts,
+ * without generating a key as a side effect.
+ *
+ * @returns The recorded issuer, or `undefined` when no key file exists.
+ * @throws InvalidKeyFileError when a file exists and does not hold a usable key.
+ */
+export function storedIssuerBinding(path: string = ISSUER_KEY_PATH): string | undefined {
+  return loadStoredKey(path)?.issuer;
 }
 
 /**
@@ -231,8 +258,10 @@ export async function resolveIssuerKey(
     const privateKey = Uint8Array.from(Buffer.from(stored.privateKeyHex, 'hex'));
     try {
       return { privateKey, publicKey: await derivePublicKey(privateKey), kid: stored.kid, iss };
-    } catch (e) {
-      refuseKeyFile(path, `its private key is not usable (${(e as Error).message.split('\n')[0]})`);
+    } catch {
+      // The library's message is not echoed: this diagnostic surfaces in command output, and
+      // fixed prose says everything a reader can act on.
+      refuseKeyFile(path, 'its private key is not usable: public-key derivation refused it');
     }
   }
 

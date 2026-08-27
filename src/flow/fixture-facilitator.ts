@@ -124,12 +124,14 @@ class FixtureExactEvmFacilitator implements SchemeNetworkFacilitator {
    *
    * On the network, a consumed EIP-3009 authorization cannot produce a second transfer, and the
    * consumed state is keyed by the pair `(authorizer, nonce)` — never by the nonce alone, since
-   * two authorizers may independently use the same nonce value. This set models that
-   * authorizer-scoped fixture consumption so the repeated-settlement branch of the lifecycle is
-   * reachable without a chain; it belongs to one facilitator instance, dedupes within a run, and
-   * never carries state between runs. It is a stand-in and is recorded as one: it does not claim
-   * to prove the network's replay mechanism, and no output derived from it names the mechanism a
-   * real facilitator or the network enforces.
+   * two authorizers may independently use the same nonce value. This set models SUCCESSFUL
+   * authorizer-scoped fixture consumption only — a pair enters it exactly when a settlement
+   * returns success, never when one raises, is refused, or fails the terms comparison — so the
+   * repeated-settlement branch of the lifecycle is reachable without a chain while a failed
+   * attempt leaves the authorization spendable. It belongs to one facilitator instance, dedupes
+   * within a run, and never carries state between runs. It is a stand-in and is recorded as one:
+   * it does not claim to prove the network's replay mechanism, and no output derived from it
+   * names the mechanism a real facilitator or the network enforces.
    */
   private readonly settledAuthorizations = new Set<string>();
 
@@ -169,19 +171,14 @@ class FixtureExactEvmFacilitator implements SchemeNetworkFacilitator {
   ): Promise<SettleResponse> {
     this.calls.settle++;
     const identity = authorizationIdentity(payload);
-    if (identity !== undefined) {
-      if (this.settledAuthorizations.has(identity)) {
-        return {
-          success: false,
-          errorReason: DUPLICATE_SETTLEMENT_REASON,
-          transaction: '',
-          network: requirements.network,
-          payer: F.PAYER,
-        };
-      }
-      // Consumed before the first await, so two settlements of one authorization cannot interleave
-      // past the check.
-      this.settledAuthorizations.add(identity);
+    if (identity !== undefined && this.settledAuthorizations.has(identity)) {
+      return {
+        success: false,
+        errorReason: DUPLICATE_SETTLEMENT_REASON,
+        transaction: '',
+        network: requirements.network,
+        payer: F.PAYER,
+      };
     }
     if (this.behavior.throwOnSettle !== undefined) throw new Error(this.behavior.throwOnSettle);
     if (this.behavior.rejectSettlement !== undefined) {
@@ -203,6 +200,13 @@ class FixtureExactEvmFacilitator implements SchemeNetworkFacilitator {
         payer: F.PAYER,
       };
     }
+    // Consumed ONLY on the path that returns success, and immediately before it: a settlement
+    // that raised, was refused, or failed the terms comparison has not consumed the
+    // authorization, and a corrected retry of the same authorization must still be able to
+    // settle. This models successful authorization consumption only. There is no await between
+    // the duplicate check above and this line, so two settlements of one authorization cannot
+    // interleave past the check; no claim is made about the mechanism the real network enforces.
+    if (identity !== undefined) this.settledAuthorizations.add(identity);
     return {
       success: true,
       transaction: F.SETTLEMENT_TX_HASH,

@@ -27,13 +27,20 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { isIP, type Socket } from 'node:net';
 import express, { type Express, type Request, type Response } from 'express';
 import { paymentMiddlewareFromHTTPServer } from '@x402/express';
+import { decodePaymentSignatureHeader } from '@x402/core/http';
 import {
   x402HTTPResourceServer,
   x402ResourceServer,
   type FacilitatorClient,
   type RouteConfig,
 } from '@x402/core/server';
-import type { Network } from '@x402/core/types';
+import type { Network, PaymentPayload } from '@x402/core/types';
+import {
+  PAYMENT_IDENTIFIER,
+  extractPaymentIdentifier,
+  isPaymentIdentifierRequired,
+  validatePaymentIdentifierRequirement,
+} from '@x402/extensions/payment-identifier';
 import {
   captureRequestComponents,
   ComponentError,
@@ -105,6 +112,34 @@ export interface PaidResource {
 interface RequestState {
   readonly recorder: LifecycleRecorder;
   originResult?: OriginResult;
+  /** The valid payment identifier this request presented, when it presented one. */
+  paymentId?: string;
+}
+
+/**
+ * Run-local idempotency state for one payment identifier.
+ *
+ * The lifetime of this store is the lifetime of the resource instance — one run of this example —
+ * which is this reference's stand-in for the time-to-live window the extension's documentation
+ * leaves to the application. Nothing here persists between runs, and nothing here is, or replaces,
+ * a native x402 artifact: the cached bytes are the origin's own produced result and the field
+ * value the middleware itself emitted for the settlement that actually happened.
+ */
+interface IdempotencyEntry {
+  /** The normalized request fingerprint the identifier was first bound to. */
+  readonly fingerprint: string;
+  /**
+   * The result cached after a SUCCESSFUL settlement, and only then. A run that failed before
+   * settlement caches nothing, so a replay of it goes through payment processing again and the
+   * cache can never manufacture a settlement that did not happen.
+   */
+  settled?: {
+    readonly status: number;
+    readonly contentType: string;
+    readonly body: Uint8Array;
+    /** The PAYMENT-RESPONSE field value emitted for the settlement that actually occurred. */
+    readonly paymentResponse?: string;
+  };
 }
 
 /**
@@ -255,6 +290,36 @@ export async function createPaidResource(options: PaidResourceOptions): Promise<
 
   await httpServer.initialize();
 
+  /**
+   * Run-local idempotency for the payment-identifier extension, implementing the semantics its
+   * documentation assigns to the resource server: the identifier binds to a normalized request
+   * fingerprint on first use; a retry with the same identifier and the same fingerprint after a
+   * successful settlement is served the cached result WITHOUT processing another payment; the
+   * same identifier with a DIFFERENT fingerprint is refused with 409 and neither reuses the
+   * cached result nor creates a payment; and, because the declaration here marks the identifier
+   * required, a payment payload without a valid one is refused with 400 before any verification.
+   *
+   * The fingerprint covers what the extension's documentation names: method and route (the
+   * origin-form target as received) plus the scheme, network, asset, amount and recipient this
+   * resource advertises. The store's lifetime is this resource instance — one run — which stands
+   * in for the documented time-to-live window; nothing persists between runs. Extraction and
+   * requirement checks are the upstream extension APIs, not local reimplementations.
+   */
+  const idempotency = new Map<string, IdempotencyEntry>();
+  const identifierRequired = isPaymentIdentifierRequired(
+    options.declaredExtensions?.[PAYMENT_IDENTIFIER],
+  );
+  const requestFingerprint = (req: Request): string =>
+    JSON.stringify([
+      req.method,
+      req.originalUrl,
+      'exact',
+      options.network,
+      options.price.asset,
+      options.price.amount,
+      options.payTo,
+    ]);
+
   const app = express();
 
   // The framework advertises itself on every response by default. It tells a caller nothing they
@@ -274,6 +339,70 @@ export async function createPaidResource(options: PaidResourceOptions): Promise<
       // Captured now, while the socket the request arrived on is still the one in hand.
       const components = captureComponents(req);
 
+      // Idempotency decisions run BEFORE the finish listener is registered: a request this layer
+      // answers never reaches the payment middleware, records no lifecycle, and therefore adds no
+      // observation that would misdescribe how it was handled. A field value that does not decode
+      // is passed through untouched — the payment middleware is the authority on refusing it, and
+      // this layer must not preempt that refusal with a verdict of its own.
+      if (observedSignature !== undefined) {
+        let payload: PaymentPayload | undefined;
+        try {
+          const decoded = decodePaymentSignatureHeader(observedSignature);
+          if (typeof decoded === 'object' && decoded !== null && !Array.isArray(decoded)) {
+            payload = decoded as PaymentPayload;
+          }
+        } catch {
+          // Not decodable as a payment payload; handled by the middleware's own path.
+        }
+        if (payload !== undefined) {
+          const requirement = validatePaymentIdentifierRequirement(payload, identifierRequired);
+          if (!requirement.valid) {
+            // The declaration marks the identifier required, and this payload carries no valid
+            // one: 400 per the extension's documented semantics, before any verification.
+            res
+              .status(400)
+              .set('content-type', 'application/json')
+              .end('{"error":"a valid payment identifier is required"}');
+            return;
+          }
+          const paymentId = extractPaymentIdentifier(payload);
+          if (paymentId !== null) {
+            const fingerprint = requestFingerprint(req);
+            const entry = idempotency.get(paymentId);
+            if (entry === undefined) {
+              // First use binds the identifier to this request's fingerprint.
+              idempotency.set(paymentId, { fingerprint });
+              requestState.paymentId = paymentId;
+            } else if (entry.fingerprint !== fingerprint) {
+              // The same identifier naming a different request must neither return the old
+              // result nor create another payment: a 409-style refusal, per the documentation.
+              res
+                .status(409)
+                .set('content-type', 'application/json')
+                .end('{"error":"this payment identifier is bound to a different request"}');
+              return;
+            } else if (entry.settled !== undefined) {
+              // Same identifier, same request, settlement already succeeded: the cached result,
+              // with no payment processing. The PAYMENT-RESPONSE value repeated here is the one
+              // the middleware emitted for the settlement that actually happened.
+              if (entry.settled.paymentResponse !== undefined) {
+                res.set('payment-response', entry.settled.paymentResponse);
+              }
+              res
+                .status(entry.settled.status)
+                .set('content-type', entry.settled.contentType)
+                .end(Buffer.from(entry.settled.body));
+              return;
+            } else {
+              // Same identifier, same request, no settled result cached: an earlier attempt did
+              // not settle, so this attempt goes through payment processing normally. The cache
+              // never manufactures a settlement it did not observe.
+              requestState.paymentId = paymentId;
+            }
+          }
+        }
+      }
+
       res.on('finish', () => {
         const reached = recorder.observation();
         if (reached.states.includes('payment_settled')) {
@@ -282,6 +411,23 @@ export async function createPaidResource(options: PaidResourceOptions): Promise<
           recorder.enter('response_prepared');
           recorder.enter('response_write_attempted');
           recorder.finish('response_write_attempted', { responseStatus: res.statusCode });
+          // Cache the settled result for the payment identifier this request presented, so a
+          // retry with the same identifier and the same request is served this result instead of
+          // processing another payment. Only a settlement that actually succeeded reaches here.
+          const paymentId = requestState.paymentId;
+          const produced = requestState.originResult;
+          if (paymentId !== undefined && produced !== undefined) {
+            const entry = idempotency.get(paymentId);
+            if (entry !== undefined && entry.settled === undefined) {
+              const paymentResponse = headerValue(res, 'payment-response');
+              entry.settled = {
+                status: res.statusCode,
+                contentType: produced.contentType,
+                body: produced.body,
+                ...(paymentResponse !== undefined ? { paymentResponse } : {}),
+              };
+            }
+          }
         } else if (
           !recorder.hasTerminalState() &&
           reached.states.includes('payment_payload_received') &&

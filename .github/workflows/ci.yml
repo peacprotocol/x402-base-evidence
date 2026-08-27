@@ -18,6 +18,13 @@ jobs:
       fail-fast: false
       matrix:
         node: ['22', '24']
+        include:
+          # Node 26 (Current) runs as a NON-BLOCKING canary: a failure is visible in the job list
+          # but never blocks the pull request. Node 24 stays the blocking baseline and Node 22 the
+          # compatibility floor; the engines field is deliberately unchanged.
+          - node: '26'
+    # Only the canary row may fail without failing the workflow.
+    continue-on-error: ${{ matrix.node == '26' }}
     steps:
       # Actions are pinned to immutable commit SHAs. A tag can be moved; a SHA cannot.
       - name: Checkout
