@@ -30,7 +30,8 @@
  * useful answer: which stage failed is what a reader acts on.
  */
 import type { AddressInfo } from 'node:net';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { createServer, type Server } from 'node:http';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -65,16 +66,43 @@ import {
   runOnce,
 } from './flow/fixture-e2e.ts';
 import { writeEvidence, type EvidenceLayout } from './flow/issue-record.ts';
-import { resolveIssuerKey } from './flow/issuer-key.ts';
+import {
+  IssuerConfigurationError,
+  resolveIssuerKey,
+} from './flow/issuer-key.ts';
+import { InvalidKeyFileError } from './flow/key-file.ts';
+import { loadPayerAccount } from './flow/payer-key.ts';
 import { compareExpectationToObservation } from './flow/observe-settlement.ts';
 import {
+  admitReceiptResult,
+  admitSealedBlockResult,
+  admitTransactionResult,
+  baseSealedRpcSource,
+  ENDPOINT_RPC_ERROR,
+  ENDPOINT_RESPONSE_UNUSABLE,
+  MALFORMED_TRANSACTION_REFERENCE,
+  MAX_RECEIPT_LOGS,
   observeSealedTransaction,
   TRANSFER_EVENT_TOPIC,
   transfersOnContract,
   type ObservedLog,
   type SealedTransactionSource,
 } from './flow/observe-transaction.ts';
-import { checkLocalConfiguration, distinctRolesCheck, expectedUsdcAsset } from './flow/preflight.ts';
+import {
+  admitAbiUint256Word,
+  admitRpcQuantity,
+  JsonRpcFailure,
+  jsonRpcRequest,
+} from './flow/evm-json-rpc.ts';
+import {
+  checkChainState,
+  checkIssuerReadiness,
+  checkLocalConfiguration,
+  distinctRolesCheck,
+  expectedUsdcAsset,
+  jsonRpcChainState,
+  reviewerMaterialWritableCheck,
+} from './flow/preflight.ts';
 import {
   verifyEvidence,
   type EvidenceVerificationReport,
@@ -637,25 +665,28 @@ recordExecution('EVM-REPLAY-001');
 // (authorizer, nonce), the way EIP-3009 keys `authorizationState(address authorizer, bytes32
 // nonce)`. The same authorizer repeating a nonce is a duplicate — under any hex casing — while a
 // different authorizer using the same nonce value is a different authorization and must not
-// collide with it.
+// collide with it. And consumption models a SUCCESSFUL settlement only: an attempt that the
+// facilitator refuses has not consumed the authorization, so a corrected retry of the same
+// authorizer-and-nonce pair must still settle.
 {
-  const withAuthorizer = (from: string): PaymentPayload =>
+  const withAuthorization = (from: string, nonce: string = F.AUTHORIZATION_NONCE): PaymentPayload =>
     structuredClone({
       ...F.PAYMENT_PAYLOAD,
       payload: {
         ...F.PAYMENT_PAYLOAD.payload,
-        authorization: { ...F.EXACT_EVM_AUTHORIZATION, from },
+        authorization: { ...F.EXACT_EVM_AUTHORIZATION, from, nonce },
       },
     });
   const otherAuthorizer = '0x00000000000000000000000000000000000000aa';
+  const otherNonce = `0x${'5c'.repeat(32)}`;
   const scoped = createFixtureFacilitator(F.NETWORK);
-  const first = await scoped.client.settle(withAuthorizer(F.PAYER), F.PAYMENT_REQUIREMENTS);
+  const first = await scoped.client.settle(withAuthorization(F.PAYER), F.PAYMENT_REQUIREMENTS);
   const repeated = await scoped.client.settle(
-    withAuthorizer(`0x${F.PAYER.slice(2).toUpperCase()}`),
+    withAuthorization(`0x${F.PAYER.slice(2).toUpperCase()}`),
     F.PAYMENT_REQUIREMENTS,
   );
   const differentAuthorizer = await scoped.client.settle(
-    withAuthorizer(otherAuthorizer),
+    withAuthorization(otherAuthorizer),
     F.PAYMENT_REQUIREMENTS,
   );
   check(
@@ -672,6 +703,41 @@ recordExecution('EVM-REPLAY-001');
     'a different authorizer using the same nonce value does not collide with the consumed pair',
     differentAuthorizer.success === true,
     JSON.stringify(differentAuthorizer),
+  );
+
+  // A fresh authorization presented against a requirement it does not satisfy is refused — and
+  // that refusal must NOT consume it. On the network only the successful call changes the
+  // ERC-3009 authorization state; a stand-in that consumed on failure would make the retry
+  // branch unreachable and would model a mechanism the standard does not have.
+  const refusedAttempt = await scoped.client.settle(withAuthorization(F.PAYER, otherNonce), {
+    ...F.PAYMENT_REQUIREMENTS,
+    amount: '999999999',
+  });
+  check(
+    'a settlement refused on its requirements reports the refusal and no transaction',
+    refusedAttempt.success === false &&
+      refusedAttempt.errorReason === 'amount_mismatch' &&
+      refusedAttempt.transaction === '',
+    JSON.stringify(refusedAttempt),
+  );
+  const correctedRetry = await scoped.client.settle(
+    withAuthorization(F.PAYER, otherNonce),
+    F.PAYMENT_REQUIREMENTS,
+  );
+  check(
+    'the same authorization settles after a refused attempt: a failed settlement does not consume it',
+    correctedRetry.success === true,
+    JSON.stringify(correctedRetry),
+  );
+  const consumedAfterSuccess = await scoped.client.settle(
+    withAuthorization(F.PAYER, otherNonce),
+    F.PAYMENT_REQUIREMENTS,
+  );
+  check(
+    'only the successful settlement consumed it: the pair now refuses as a duplicate',
+    consumedAfterSuccess.success === false &&
+      consumedAfterSuccess.errorReason === DUPLICATE_SETTLEMENT_REASON,
+    JSON.stringify(consumedAfterSuccess),
   );
 }
 
@@ -995,6 +1061,428 @@ recordExecution('EVM-EVIDENCE-001');
 }
 
 // ---------------------------------------------------------------------------------------------
+// Evidence, continued: strict EIP-1474 shapes and the JSON-RPC envelope.
+//
+// Completes EVM-EVIDENCE-001 on the observation's input side. A false "the expected transfer is
+// absent" can be produced not only by misreading logs but by admitting a response that should
+// have been refused: a truncated log list, a silently dropped malformed entry, or a balance word
+// read under the wrong RPC type. These vectors hold every admission to the type the RPC method
+// actually returns and prove that an inadmissible response withholds the verdict rather than
+// shading it.
+// ---------------------------------------------------------------------------------------------
+
+console.log('\n  -- evidence: strict RPC admission --');
+
+// EIP-1474 Quantity versus ABI Data, decided by the actual type of each value.
+{
+  check(
+    'canonical quantities are admitted: 0x0, 0x1, 0x400',
+    admitRpcQuantity('0x0') === 0n && admitRpcQuantity('0x1') === 1n && admitRpcQuantity('0x400') === 1024n,
+  );
+  check(
+    'leading-zero quantities are refused: 0x00, 0x01, 0x0400',
+    admitRpcQuantity('0x00') === undefined &&
+      admitRpcQuantity('0x01') === undefined &&
+      admitRpcQuantity('0x0400') === undefined,
+  );
+  check(
+    'non-string and empty quantities are refused',
+    admitRpcQuantity(1) === undefined && admitRpcQuantity('0x') === undefined && admitRpcQuantity(undefined) === undefined,
+  );
+  const paddedWord = `0x${'0'.repeat(58)}0f4240`;
+  check(
+    'a zero-padded 32-byte balanceOf word is admitted as ABI data — it is not a Quantity',
+    admitAbiUint256Word(paddedWord) === 1_000_000n,
+  );
+  check(
+    'short or malformed balanceOf results are refused, including quantity-shaped ones',
+    admitAbiUint256Word('0x1') === undefined &&
+      admitAbiUint256Word('0x') === undefined &&
+      admitAbiUint256Word(`0x${'0'.repeat(63)}`) === undefined &&
+      admitAbiUint256Word(`0x${'0'.repeat(65)}`) === undefined,
+  );
+}
+
+// Receipt, transaction and block admissions: one malformed member refuses the whole response.
+{
+  const blockHash = '0x'.padEnd(66, 'b');
+  const goodLog = {
+    address: F.ASSET_CONTRACT,
+    topics: [TRANSFER_EVENT_TOPIC],
+    data: `0x${'0'.repeat(64)}`,
+  };
+  const receiptWith = (overrides: Record<string, unknown>): unknown => ({
+    status: '0x1',
+    blockNumber: '0x384',
+    blockHash,
+    logs: [goodLog],
+    ...overrides,
+  });
+  const refuses = (value: unknown, admit: (v: unknown) => unknown): boolean => {
+    try {
+      admit(value);
+      return false;
+    } catch (e) {
+      return e instanceof JsonRpcFailure && e.kind === 'unusable';
+    }
+  };
+
+  check(
+    'a well-formed receipt is admitted with its placement and logs intact',
+    (() => {
+      const admitted = admitReceiptResult(receiptWith({}));
+      return admitted.status === 'success' && admitted.blockNumber === 900n && admitted.logs.length === 1;
+    })(),
+  );
+  check(
+    'a receipt with a leading-zero block number is refused, never normalized',
+    refuses(receiptWith({ blockNumber: '0x0384' }), admitReceiptResult),
+  );
+  check(
+    'a receipt with a malformed block hash is refused',
+    refuses(receiptWith({ blockHash: '0xshort' }), admitReceiptResult),
+  );
+  check(
+    'a receipt whose logs member is missing or not an array is refused',
+    refuses(receiptWith({ logs: undefined }), admitReceiptResult) &&
+      refuses(receiptWith({ logs: 'none' }), admitReceiptResult),
+  );
+  check(
+    'a receipt reporting more logs than the bound is refused whole, never truncated',
+    refuses(receiptWith({ logs: Array.from({ length: MAX_RECEIPT_LOGS + 1 }, () => goodLog) }), admitReceiptResult),
+  );
+  check(
+    'one malformed log refuses the receipt: entries are never silently dropped',
+    refuses(receiptWith({ logs: [goodLog, { ...goodLog, address: 'not-an-address' }] }), admitReceiptResult) &&
+      refuses(receiptWith({ logs: [goodLog, { ...goodLog, topics: ['0x1234'] }] }), admitReceiptResult) &&
+      refuses(receiptWith({ logs: [goodLog, { ...goodLog, data: '0xabc' }] }), admitReceiptResult),
+  );
+  check(
+    'a transaction object with a malformed sender or placement is refused',
+    refuses({ from: 'not-an-address', blockNumber: '0x384', blockHash }, admitTransactionResult) &&
+      refuses({ from: F.PAYER, blockNumber: '0x0384', blockHash }, admitTransactionResult) &&
+      refuses({ from: F.PAYER, blockNumber: '0x384', blockHash: '0x12' }, admitTransactionResult),
+  );
+  check(
+    'a block whose transaction list holds one malformed member is refused for any inclusion claim',
+    refuses(
+      { number: '0x384', hash: blockHash, transactions: [F.SETTLEMENT_TX_HASH, 'not-a-hash'] },
+      admitSealedBlockResult,
+    ) && refuses({ number: '0x384', hash: blockHash, transactions: 'none' }, admitSealedBlockResult),
+  );
+  check(
+    'a well-formed block is admitted with its full transaction list',
+    admitSealedBlockResult({ number: '0x384', hash: blockHash, transactions: [F.SETTLEMENT_TX_HASH] })
+      .transactionHashes.length === 1,
+  );
+}
+
+// The JSON-RPC envelope itself, against a real HTTP endpoint on the loopback interface. The stub
+// is scripted per test; nothing here reaches beyond the process's own listener.
+interface RpcStubBehavior {
+  status?: number;
+  rawBody?: string;
+  envelope?: (id: unknown, method: string) => unknown;
+}
+{
+  const requests: string[] = [];
+  let behavior: RpcStubBehavior = {};
+  const stub: Server = createServer((req, res) => {
+    let raw = '';
+    req.on('data', (chunk: Buffer) => (raw += chunk.toString('utf8')));
+    req.on('end', () => {
+      const parsed = JSON.parse(raw) as { id: unknown; method: string };
+      requests.push(parsed.method);
+      res.statusCode = behavior.status ?? 200;
+      res.setHeader('content-type', 'application/json');
+      res.end(
+        behavior.rawBody ??
+          JSON.stringify(
+            behavior.envelope?.(parsed.id, parsed.method) ?? {
+              jsonrpc: '2.0',
+              id: parsed.id,
+              result: null,
+            },
+          ),
+      );
+    });
+  });
+  await new Promise<void>((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  const { port } = stub.address() as AddressInfo;
+  const stubUrl = `http://127.0.0.1:${port}`;
+
+  const failureKind = async (): Promise<string> => {
+    try {
+      await jsonRpcRequest(stubUrl, 'eth_chainId', [], 2000);
+      return 'no-failure';
+    } catch (e) {
+      return e instanceof JsonRpcFailure ? e.kind : 'unclassified';
+    }
+  };
+
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, result: '0x14a34' }) };
+  check(
+    'a well-formed envelope returns its result',
+    (await jsonRpcRequest(stubUrl, 'eth_chainId', [], 2000)) === '0x14a34',
+  );
+  behavior = {};
+  check(
+    'a null result is returned as null: the not-found fact belongs to the caller',
+    (await jsonRpcRequest(stubUrl, 'eth_getTransactionReceipt', [F.SETTLEMENT_TX_HASH], 2000)) === null,
+  );
+  behavior = { status: 500 };
+  check('an HTTP error status is classified unreachable', (await failureKind()) === 'unreachable');
+  behavior = { rawBody: 'not json at all' };
+  check('a non-JSON body is structurally unusable', (await failureKind()) === 'unusable');
+  behavior = { rawBody: '[]' };
+  check('an array body is structurally unusable', (await failureKind()) === 'unusable');
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, error: { code: -32000, message: 'server text' } }) };
+  check('an error member alone is classified as an RPC error', (await failureKind()) === 'rpc_error');
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, result: '0x1', error: { code: -32000 } }) };
+  check(
+    'result and error together are an ambiguity and fail closed as unusable',
+    (await failureKind()) === 'unusable',
+  );
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id }) };
+  check('neither result nor error fails closed as unusable', (await failureKind()) === 'unusable');
+  behavior = { envelope: (id) => ({ jsonrpc: '1.0', id, result: '0x1' }) };
+  check('a wrong jsonrpc member fails closed as unusable', (await failureKind()) === 'unusable');
+  behavior = { envelope: () => ({ jsonrpc: '2.0', id: 999, result: '0x1' }) };
+  check('a response repeating the wrong id fails closed as unusable', (await failureKind()) === 'unusable');
+
+  // The preflight balance read, end to end through the same envelope: a 32-byte zero-padded word
+  // is a balance, and a quantity-shaped short value — the exact confusion this fixes — is not.
+  const balanceWord = `0x${'0'.repeat(58)}0f4240`;
+  behavior = {
+    envelope: (id, method) => ({
+      jsonrpc: '2.0',
+      id,
+      result: method === 'eth_chainId' ? '0x14a34' : balanceWord,
+    }),
+  };
+  {
+    const chainChecks = await checkChainState(F.PAYER, F.ASSET_CONTRACT, jsonRpcChainState(stubUrl, 2000));
+    check(
+      'the preflight admits a zero-padded balanceOf word and reads the balance from it',
+      chainChecks.every((c) => c.status === 'ok') &&
+        chainChecks.some((c) => c.detail === '1000000 base units'),
+      JSON.stringify(chainChecks),
+    );
+  }
+  behavior = {
+    envelope: (id, method) => ({
+      jsonrpc: '2.0',
+      id,
+      result: method === 'eth_chainId' ? '0x14a34' : '0x1',
+    }),
+  };
+  {
+    const chainChecks = await checkChainState(F.PAYER, F.ASSET_CONTRACT, jsonRpcChainState(stubUrl, 2000));
+    check(
+      'a quantity-shaped balanceOf result is refused as structurally unusable, not read as a balance',
+      chainChecks.some(
+        (c) => c.name === 'payer holds test USDC' && c.status === 'failed' && c.detail === ENDPOINT_RESPONSE_UNUSABLE,
+      ),
+      JSON.stringify(chainChecks),
+    );
+  }
+
+  // The sealed observation through the RPC-backed source, exercising the classification a live
+  // run would record. Placement facts here are synthetic; what is under test is this
+  // repository's own admission and classification behavior.
+  const sealedBlockHash = '0x'.padEnd(66, 'b');
+  const wiredReceipt = (logs: unknown[]): unknown => ({
+    status: '0x1',
+    blockNumber: '0x384',
+    blockHash: sealedBlockHash,
+    logs,
+  });
+  const wiredTransaction = { from: F.PAYER, blockNumber: '0x384', blockHash: sealedBlockHash };
+  const wiredBlock = (transactions: unknown[]): unknown => ({
+    number: '0x384',
+    hash: sealedBlockHash,
+    transactions,
+  });
+  const expectedTransfer = {
+    token_contract: F.ASSET_CONTRACT,
+    transfer_from: F.PAYER,
+    transfer_to: F.PAY_TO,
+    transfer_amount: F.AMOUNT_BASE_UNITS,
+  };
+  const observeThroughStub = async (): ReturnType<typeof observeSealedTransaction> =>
+    observeSealedTransaction({
+      source: baseSealedRpcSource(stubUrl, 2000),
+      transactionHash: F.SETTLEMENT_TX_HASH,
+      expectedTransfer,
+      observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
+    });
+  const routed = (bodies: Record<string, (id: unknown) => unknown>): void => {
+    behavior = {
+      envelope: (id, method) => {
+        const route = bodies[method];
+        return route === undefined ? { jsonrpc: '2.0', id, result: null } : route(id);
+      },
+    };
+  };
+
+  routed({
+    eth_getTransactionReceipt: (id) => ({
+      jsonrpc: '2.0',
+      id,
+      result: wiredReceipt(Array.from({ length: MAX_RECEIPT_LOGS + 1 }, () => ({
+        address: F.ASSET_CONTRACT,
+        topics: [TRANSFER_EVENT_TOPIC],
+        data: `0x${'0'.repeat(64)}`,
+      }))),
+    }),
+  });
+  {
+    const overBound = await observeThroughStub();
+    const comparison = compareExpectationToObservation({
+      payment_expectation: {
+        source: 'native_x402_artifact',
+        network: F.NETWORK,
+        asset: F.ASSET_CONTRACT,
+        amount_base_units: F.AMOUNT_BASE_UNITS,
+        asset_decimals: F.TOKEN_DECIMALS,
+        recipient: F.PAY_TO,
+        payer: F.PAYER,
+      },
+      chain_observation: {
+        source: { kind: 'facilitator', reference: 'synthetic' },
+        settlement_outcome: 'succeeded',
+        transaction_hash: F.SETTLEMENT_TX_HASH,
+        observed_at_unix_seconds: F.FIXED_NOW_UNIX_SECONDS,
+      },
+      rpc_observation: overBound,
+    });
+    check(
+      'a receipt over the log bound leaves the observation unavailable, never "transfer absent"',
+      overBound.observation_state === 'unavailable' &&
+        overBound.unavailable_reason === ENDPOINT_RESPONSE_UNUSABLE &&
+        comparison.transfer_event === 'not_evaluated',
+      JSON.stringify(overBound),
+    );
+  }
+
+  routed({
+    eth_getTransactionReceipt: (id) => ({
+      jsonrpc: '2.0',
+      id,
+      result: wiredReceipt([{ address: F.ASSET_CONTRACT, topics: ['0xdeadbeef'], data: '0x' }]),
+    }),
+  });
+  {
+    const malformedLog = await observeThroughStub();
+    check(
+      'a receipt holding one malformed log leaves the observation unavailable, never a verdict',
+      malformedLog.observation_state === 'unavailable' &&
+        malformedLog.unavailable_reason === ENDPOINT_RESPONSE_UNUSABLE,
+      JSON.stringify(malformedLog),
+    );
+  }
+
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, error: { code: -32005, message: 'limit' } }) };
+  {
+    const rpcError = await observeThroughStub();
+    check(
+      'an endpoint RPC error is recorded under its own fixed reason, with no server text retained',
+      rpcError.observation_state === 'unavailable' &&
+        rpcError.unavailable_reason === ENDPOINT_RPC_ERROR &&
+        !JSON.stringify(rpcError).includes('limit'),
+      JSON.stringify(rpcError),
+    );
+  }
+
+  routed({
+    eth_getTransactionReceipt: (id) => ({ jsonrpc: '2.0', id, result: wiredReceipt([]) }),
+    eth_getTransactionByHash: (id) => ({ jsonrpc: '2.0', id, result: wiredTransaction }),
+    eth_blockNumber: (id) => ({ jsonrpc: '2.0', id, result: '0x3e8' }),
+    eth_getBlockByNumber: (id) => ({
+      jsonrpc: '2.0',
+      id,
+      result: wiredBlock([F.SETTLEMENT_TX_HASH, 'not-a-transaction-hash']),
+    }),
+  });
+  {
+    const malformedList = await observeThroughStub();
+    check(
+      'a sealed block with one malformed transaction-list member yields no inclusion claim',
+      malformedList.observation_state === 'found' &&
+        malformedList.observation_level === undefined &&
+        malformedList.receipt_status === 'success',
+      JSON.stringify(malformedList),
+    );
+  }
+
+  routed({
+    eth_getTransactionReceipt: (id) => ({ jsonrpc: '2.0', id, result: wiredReceipt([]) }),
+    eth_getTransactionByHash: (id) => ({ jsonrpc: '2.0', id, result: wiredTransaction }),
+    eth_blockNumber: (id) => ({ jsonrpc: '2.0', id, result: '0x3e8' }),
+    eth_getBlockByNumber: (id) => ({ jsonrpc: '2.0', id, result: wiredBlock([F.SETTLEMENT_TX_HASH]) }),
+  });
+  {
+    const completeNoTransfer = await observeThroughStub();
+    check(
+      'a complete admitted receipt without the expected transfer is a recorded mismatch',
+      completeNoTransfer.observation_state === 'found' &&
+        completeNoTransfer.observation_level === 'l2_block_inclusion' &&
+        completeNoTransfer.token_transfer === undefined,
+      JSON.stringify(completeNoTransfer),
+    );
+  }
+
+  const pad64 = (address: string): string => `0x${'0'.repeat(24)}${address.slice(2)}`;
+  routed({
+    eth_getTransactionReceipt: (id) => ({
+      jsonrpc: '2.0',
+      id,
+      result: wiredReceipt([
+        {
+          address: F.ASSET_CONTRACT,
+          topics: [TRANSFER_EVENT_TOPIC, pad64(F.PAYER), pad64(F.PAY_TO)],
+          data: `0x${BigInt(F.AMOUNT_BASE_UNITS).toString(16).padStart(64, '0')}`,
+        },
+      ]),
+    }),
+    eth_getTransactionByHash: (id) => ({ jsonrpc: '2.0', id, result: wiredTransaction }),
+    eth_blockNumber: (id) => ({ jsonrpc: '2.0', id, result: '0x3e8' }),
+    eth_getBlockByNumber: (id) => ({ jsonrpc: '2.0', id, result: wiredBlock([F.SETTLEMENT_TX_HASH]) }),
+  });
+  {
+    const withTransfer = await observeThroughStub();
+    check(
+      'a complete admitted receipt with the expected transfer records the transfer and inclusion',
+      withTransfer.observation_state === 'found' &&
+        withTransfer.observation_level === 'l2_block_inclusion' &&
+        withTransfer.token_transfer?.transfer_amount === F.AMOUNT_BASE_UNITS,
+      JSON.stringify(withTransfer),
+    );
+  }
+
+  // The facilitator's transaction reference is validated before any endpoint is queried: a
+  // malformed reference produces its own fixed reason and zero HTTP requests.
+  requests.length = 0;
+  {
+    const malformedReference = await observeSealedTransaction({
+      source: baseSealedRpcSource(stubUrl, 2000),
+      transactionHash: '0xnot-a-hash',
+      expectedTransfer,
+      observedAtUnixSeconds: F.FIXED_NOW_UNIX_SECONDS,
+    });
+    check(
+      'a malformed transaction reference is refused before any RPC query is made',
+      malformedReference.observation_state === 'unavailable' &&
+        malformedReference.unavailable_reason === MALFORMED_TRANSACTION_REFERENCE &&
+        requests.length === 0,
+      `${JSON.stringify(malformedReference)}; requests ${requests.length}`,
+    );
+  }
+
+  await new Promise<void>((resolve) => stub.close(() => resolve()));
+}
+
+// ---------------------------------------------------------------------------------------------
 // Preflight: the locally decidable checks, exercised without a socket.
 // ---------------------------------------------------------------------------------------------
 
@@ -1035,6 +1523,121 @@ console.log('\n  -- preflight: local configuration --');
     'a payer that is also the recipient is refused as a demonstration invariant',
     distinctRolesCheck(F.PAY_TO, F.PAY_TO).status === 'failed' &&
       distinctRolesCheck(F.PAY_TO, F.PAYER).status === 'ok',
+  );
+}
+
+// Filesystem failures must never leak local directory layout into rendered output. Each vector
+// below triggers a REAL filesystem error deterministically (a path through a plain file, a
+// directory where a file is expected) and asserts the rendered diagnostic carries the bounded
+// errno name and no absolute path.
+{
+  const scratch = mkdtempSync(join(tmpdir(), 'peac-fs-errors-'));
+  temporaryDirectories.push(scratch);
+
+  const plainFile = join(scratch, 'occupied');
+  writeFileSync(plainFile, 'not a directory\n');
+  const writable = reviewerMaterialWritableCheck(join(plainFile, 'out'));
+  check(
+    'an unwritable evidence output directory reports the errno name and no absolute path',
+    writable.status === 'failed' &&
+      writable.name === 'evidence output directory is writable before any payment' &&
+      writable.detail.includes('ENOTDIR') &&
+      !writable.detail.includes(scratch) &&
+      !writable.detail.includes(tmpdir()),
+    writable.detail,
+  );
+
+  const directoryAsKey = join(scratch, 'key-directory');
+  mkdirSync(directoryAsKey);
+  let keyError = '';
+  try {
+    loadPayerAccount(directoryAsKey);
+  } catch (e) {
+    keyError = e instanceof InvalidKeyFileError ? e.message : `unexpected ${String(e)}`;
+  }
+  check(
+    'an unreadable payer key file reports the errno name, a fixed path label, and no absolute path',
+    keyError.includes('EISDIR') &&
+      keyError.includes('the configured key path') &&
+      !keyError.includes(scratch) &&
+      !keyError.includes(tmpdir()),
+    keyError,
+  );
+}
+
+// Issuer readiness for a live run: explicitly configured, usable, and consistent with any
+// existing key binding — decided without creating or modifying key material, and failing closed
+// when unset. The vectors pass explicit values, so nothing here reads or mutates the process
+// environment beyond the one deletion-protected unset case below.
+{
+  const scratch = mkdtempSync(join(tmpdir(), 'peac-issuer-readiness-'));
+  temporaryDirectories.push(scratch);
+  const keyPath = join(scratch, 'issuer.json');
+
+  const unset = checkIssuerReadiness(undefined, keyPath);
+  check(
+    'an unset issuer fails closed and the binding check is not evaluated',
+    unset[0]?.status === 'failed' &&
+      unset[0].detail.includes('PEAC_EXAMPLE_ISSUER') &&
+      unset[1]?.status === 'not_evaluated',
+    JSON.stringify(unset),
+  );
+  const unusable = checkIssuerReadiness('not-an-absolute-url', keyPath);
+  check('an unusable issuer value fails closed', unusable[0]?.status === 'failed', JSON.stringify(unusable));
+  const noKeyYet = checkIssuerReadiness('https://issuer.example.test', keyPath);
+  check(
+    'a usable issuer with no key file yet is ready, and no key file was created by checking',
+    noKeyYet.every((c) => c.status === 'ok') && !existsSync(keyPath),
+    JSON.stringify(noKeyYet),
+  );
+
+  const storedKeyBytes = `${JSON.stringify(
+    {
+      note: 'test vector',
+      kid: 'readiness-vector-key-1',
+      issuer: 'https://issuer.example.test',
+      privateKeyHex: '11'.repeat(32),
+    },
+    null,
+    2,
+  )}\n`;
+  writeFileSync(keyPath, storedKeyBytes);
+  const matching = checkIssuerReadiness('https://issuer.example.test', keyPath);
+  check(
+    'a stored issuer matching the configured issuer is ready',
+    matching.every((c) => c.status === 'ok'),
+    JSON.stringify(matching),
+  );
+  const mismatched = checkIssuerReadiness('https://other.example.test', keyPath);
+  check(
+    'a stored issuer differing from the configured issuer fails closed and names both identities',
+    mismatched[1]?.status === 'failed' &&
+      mismatched[1].detail.includes('https://issuer.example.test') &&
+      mismatched[1].detail.includes('https://other.example.test'),
+    JSON.stringify(mismatched),
+  );
+  check(
+    'the mismatch check modified nothing: the key file bytes are exactly as written',
+    readFileSync(keyPath, 'utf8') === storedKeyBytes,
+  );
+
+  // Live mode with no configured issuer must fail closed in resolution too: no issuer key is
+  // created, so nothing downstream is signable and no payment is attemptable.
+  const freshKeyPath = join(scratch, 'never-created.json');
+  const savedIssuer = process.env['PEAC_EXAMPLE_ISSUER'];
+  delete process.env['PEAC_EXAMPLE_ISSUER'];
+  let refusal: unknown;
+  try {
+    await resolveIssuerKey('live', freshKeyPath);
+  } catch (e) {
+    refusal = e;
+  } finally {
+    if (savedIssuer !== undefined) process.env['PEAC_EXAMPLE_ISSUER'] = savedIssuer;
+  }
+  check(
+    'live issuer resolution with no configured issuer fails closed and creates no key file',
+    refusal instanceof IssuerConfigurationError && !existsSync(freshKeyPath),
+    String(refusal),
   );
 }
 

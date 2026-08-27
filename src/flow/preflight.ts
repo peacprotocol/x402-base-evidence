@@ -6,9 +6,11 @@
  * discovers a missing prerequisite halfway through produces a partial transcript, which is the one
  * outcome an evidence example must not produce.
  *
- * THIS FILE AND THE LIVE DEMONSTRATION ARE THE ONLY PLACES THAT USE THE NETWORK. Nothing else in
- * the reference flow opens a connection, and the offline path never calls the network-using checks
- * here; it exercises only the local ones, which is why they are separated below.
+ * THIS FILE AND THE LIVE DEMONSTRATION ARE THE ONLY PLACES THAT PERFORM EXTERNAL NETWORK I/O.
+ * The fixture suites do open loopback sockets — a local origin serving a local client inside one
+ * process — but nothing else in the reference flow resolves a name or dials a remote host, and
+ * the offline path never calls the network-using checks here; it exercises only the local ones,
+ * which is why they are separated below.
  *
  * The payer key is created once and reused; how it is stored and reloaded lives in `payer-key.ts`.
  *
@@ -19,9 +21,10 @@
  * is recorded in the evidence as `transaction_sender`, an observed fact; no role beyond having
  * broadcast is inferred from it.
  *
- * REVIEWER MATERIAL COMES BEFORE FUNDS. The last local check proves the directory that will hold
- * the public half of the signing key is writable, before any payment is attempted, so there is no
- * state in which funds moved and the material a reviewer needs cannot be written.
+ * EVIDENCE OUTPUT COMES BEFORE FUNDS. The last local check proves the `out/` directory a run
+ * writes its evidence and verification material into is writable, before any payment is
+ * attempted, so there is no state in which funds moved and the material a reviewer needs cannot
+ * be written.
  */
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -31,9 +34,23 @@ import { isAddress } from 'viem';
 import { DEFAULT_ASSETS } from '@x402/evm';
 import type { FacilitatorClient } from '@x402/core/server';
 import type { Network } from '@x402/core/types';
-import { NETWORK } from '../../fixtures/deterministic.ts';
-import { displayKeyPath } from './key-file.ts';
-import { ENDPOINT_UNREACHABLE } from './observe-transaction.ts';
+import { AMOUNT_BASE_UNITS, NETWORK } from '../../fixtures/deterministic.ts';
+import {
+  JSON_RPC_FAILURE_TEXT,
+  JsonRpcFailure,
+  admitAbiUint256Word,
+  admitRpcQuantity,
+  jsonRpcRequest,
+} from './evm-json-rpc.ts';
+import {
+  assertUsableIssuer,
+  ISSUER_KEY_PATH,
+  IssuerConfigurationError,
+  LIVE_ISSUER_ENV,
+  storedIssuerBinding,
+} from './issuer-key.ts';
+import { boundedFsErrorName, displayKeyPath, InvalidKeyFileError } from './key-file.ts';
+import { ENDPOINT_UNREACHABLE, publicEndpointReference } from './observe-transaction.ts';
 import { loadPayerAccount, PAYER_KEY_PATH, resolvePayerAccount } from './payer-key.ts';
 
 const APP_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
@@ -50,6 +67,8 @@ export const MIN_USDC_BASE_UNITS = 1_000_000n;
 export const FUNDING_INSTRUCTIONS = [
   'Test USDC: request Base Sepolia USDC for the payer address from a public testnet faucet.',
   'ETH is not required: the facilitator broadcasts the transaction under EIP-3009.',
+  'Recipient: set PEAC_EXAMPLE_PAY_TO to a Base Sepolia address the operator controls.',
+  'Issuer: set PEAC_EXAMPLE_ISSUER to the absolute http or https URL of the issuing party.',
 ].join('\n  ');
 
 /**
@@ -142,14 +161,87 @@ export function distinctRolesCheck(payTo: string, payerAddress: string): Preflig
 }
 
 /**
- * Prove the directory that will hold reviewer material is writable, before anything is spent.
+ * Whether a live run's issuer identity is ready, decided without touching key material.
  *
- * A probe file is created exclusively, read back, and removed. Nothing else is touched: the real
- * key file for a run is written by the run itself, exclusively, so this check can never overwrite
- * or reserve anything a run will use.
+ * TWO CHECKS, BOTH FAIL-CLOSED AND BOTH SIDE-EFFECT-FREE. First, the issuer must be explicitly
+ * configured and usable: live mode has no default issuer, so an absent or unusable value is a
+ * failed check, no issuer key is created, and no payment is attemptable past it. Second, when an
+ * issuer key file already exists, the issuer it records must be the configured one: a mismatch is
+ * reported with the stored and configured identities — values the operator supplied, not key
+ * material — and the key file is left exactly as it was. Nothing here generates a key; only a run
+ * that has passed the whole preflight creates one, at run start.
+ */
+export function checkIssuerReadiness(
+  configuredIssuer: string | undefined,
+  keyPath: string = ISSUER_KEY_PATH,
+): PreflightCheck[] {
+  const configuredName = 'issuer is explicitly configured for live mode';
+  const bindingName = 'existing issuer key records the configured issuer';
+
+  if (configuredIssuer === undefined || configuredIssuer.length === 0) {
+    return [
+      failed(
+        configuredName,
+        `${LIVE_ISSUER_ENV} is not set; live mode has no default issuer, so no issuer key is ` +
+          'created and no payment can be attempted',
+      ),
+      notEvaluated(bindingName, 'no issuer is configured to compare against'),
+    ];
+  }
+  let issuer: string;
+  try {
+    issuer = assertUsableIssuer(configuredIssuer);
+  } catch (e) {
+    const reason =
+      e instanceof IssuerConfigurationError
+        ? e.message.split('\n')[0] ?? 'the configured issuer cannot be used'
+        : 'the configured issuer cannot be used';
+    return [
+      failed(configuredName, reason),
+      notEvaluated(bindingName, 'no usable issuer is configured to compare against'),
+    ];
+  }
+
+  let stored: string | undefined;
+  try {
+    stored = storedIssuerBinding(keyPath);
+  } catch (e) {
+    // The key file exists and is not usable. Its diagnostic already carries the repository-relative
+    // path and a bounded reason; the file itself was not modified.
+    const reason = e instanceof InvalidKeyFileError ? e.reason : 'the issuer key file could not be read';
+    return [ok(configuredName, issuer), failed(bindingName, `the issuer key file was refused: ${reason}`)];
+  }
+  if (stored === undefined) {
+    return [
+      ok(configuredName, issuer),
+      ok(bindingName, 'no issuer key exists yet; a run will create one bound to the configured issuer'),
+    ];
+  }
+  if (stored === issuer) {
+    return [ok(configuredName, issuer), ok(bindingName, 'the stored issuer matches the configured issuer')];
+  }
+  return [
+    ok(configuredName, issuer),
+    failed(
+      bindingName,
+      `the key at ${displayKeyPath(keyPath)} records issuer ${stored}, but this run is configured ` +
+        `for ${issuer}. The key file was not modified. Either configure the issuer the key already ` +
+        'claims, or move the key file aside so a new key is created for the new issuer',
+    ),
+  ];
+}
+
+/**
+ * Prove the evidence output directory (`out/`) is writable, before anything is spent.
+ *
+ * That directory is where a live run writes its evidence and the public half of its signing key,
+ * so this is the "no run may spend funds it cannot document" gate. A probe file is created
+ * exclusively, read back, and removed. Nothing else is touched: the real files for a run are
+ * written by the run itself, exclusively, so this check can never overwrite or reserve anything a
+ * run will use.
  */
 export function reviewerMaterialWritableCheck(outDirectory: string = join(APP_ROOT, 'out')): PreflightCheck {
-  const name = 'reviewer key material is writable before any payment';
+  const name = 'evidence output directory is writable before any payment';
   const probe = join(outDirectory, `.write-probe-${randomBytes(6).toString('hex')}`);
   try {
     mkdirSync(outDirectory, { recursive: true });
@@ -166,7 +258,9 @@ export function reviewerMaterialWritableCheck(outDirectory: string = join(APP_RO
     } catch {
       // The probe could not be removed; the directory state is already the reported failure.
     }
-    return failed(name, `the output directory could not be written (${(e as Error).message.split('\n')[0]})`);
+    // The caught message embeds the absolute path it failed on, and this detail is printed to a
+    // terminal; the allowlisted errno name is the bounded fact worth reporting.
+    return failed(name, `the output directory could not be written (${boundedFsErrorName(e)})`);
   }
 }
 
@@ -244,33 +338,29 @@ export interface ChainStateRpc {
 /** The `balanceOf(address)` selector, the one call the balance check makes. */
 const BALANCE_OF_SELECTOR = '0x70a08231';
 
-/** A chain-state endpoint backed by raw JSON-RPC. Constructed only by a live preflight. */
+/**
+ * A chain-state endpoint backed by raw JSON-RPC. Constructed only by a live preflight.
+ *
+ * Each value is admitted by its actual RPC type. `eth_chainId` returns an EIP-1474 Quantity. The
+ * `eth_call` result of `balanceOf(address)` is NOT a Quantity: it is the ABI-encoded return value
+ * of a `uint256`, exactly one 32-byte Data word with its leading zero bytes intact, and it is
+ * admitted as that. Reading it with a Quantity rule would refuse well-formed balances (every word
+ * with a leading zero byte) while admitting values the Data type forbids.
+ */
 export function jsonRpcChainState(rpcUrl: string, timeoutMs = PREFLIGHT_RPC_TIMEOUT_MS): ChainStateRpc {
-  const call = async (method: string, params: readonly unknown[]): Promise<unknown> => {
-    const response = await fetch(rpcUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!response.ok) throw new Error(`rpc status ${response.status}`);
-    const body = (await response.json()) as { result?: unknown; error?: unknown };
-    if (body.error !== undefined) throw new Error('rpc error');
-    return body.result;
-  };
-  const quantity = (value: unknown): bigint => {
-    if (typeof value !== 'string' || !/^0x[0-9a-fA-F]+$/.test(value)) {
-      throw new Error('the endpoint reported a value this run could not read');
-    }
-    return BigInt(value);
-  };
   return {
     async chainId(): Promise<bigint> {
-      return quantity(await call('eth_chainId', []));
+      const chainId = admitRpcQuantity(await jsonRpcRequest(rpcUrl, 'eth_chainId', [], timeoutMs));
+      if (chainId === undefined) throw new JsonRpcFailure('unusable');
+      return chainId;
     },
     async erc20Balance(tokenContract: string, owner: string): Promise<bigint> {
       const data = `${BALANCE_OF_SELECTOR}${owner.slice(2).toLowerCase().padStart(64, '0')}`;
-      return quantity(await call('eth_call', [{ to: tokenContract, data }, 'latest']));
+      const word = admitAbiUint256Word(
+        await jsonRpcRequest(rpcUrl, 'eth_call', [{ to: tokenContract, data }, 'latest'], timeoutMs),
+      );
+      if (word === undefined) throw new JsonRpcFailure('unusable');
+      return word;
     },
   };
 }
@@ -292,13 +382,19 @@ export async function checkChainState(
 ): Promise<PreflightCheck[]> {
   const checks: PreflightCheck[] = [];
 
+  // A caught endpoint failure is reported through the bounded JSON-RPC failure vocabulary:
+  // unreachable or timed out, answered with an RPC error, or structurally unusable. Nothing the
+  // endpoint said is repeated.
+  const endpointFailureText = (e: unknown): string =>
+    e instanceof JsonRpcFailure ? JSON_RPC_FAILURE_TEXT[e.kind] : ENDPOINT_UNREACHABLE;
+
   let chainId: bigint;
   try {
     chainId = await rpc.chainId();
-  } catch {
+  } catch (e) {
     return [
-      failed(CHAIN_ID_CHECK, ENDPOINT_UNREACHABLE),
-      notEvaluated('payer holds test USDC', 'the endpoint did not answer'),
+      failed(CHAIN_ID_CHECK, endpointFailureText(e)),
+      notEvaluated('payer holds test USDC', 'the endpoint did not usefully answer'),
     ];
   }
   checks.push(
@@ -313,8 +409,8 @@ export async function checkChainState(
   let balance: bigint;
   try {
     balance = await rpc.erc20Balance(asset, payerAddress);
-  } catch {
-    checks.push(failed('payer holds test USDC', ENDPOINT_UNREACHABLE));
+  } catch (e) {
+    checks.push(failed('payer holds test USDC', endpointFailureText(e)));
     return checks;
   }
   checks.push(
@@ -381,19 +477,28 @@ export interface PreflightOptions {
   readonly payerKeyPath?: string;
   /** Where reviewer material will be written. Defaults to the repository `out/` directory. */
   readonly outDirectory?: string;
+  /**
+   * Issuer readiness for a live run: the configured issuer value, exactly as it arrived, and
+   * where the issuer key file lives. When present, the issuer checks run as part of the local
+   * phase; the offline suites that exercise other checks omit it.
+   */
+  readonly issuer?: { readonly configured: string | undefined; readonly keyPath?: string };
 }
 
 /**
  * The full preflight. Fails closed: any failed check leaves the run not ready.
  *
- * Ordered so that everything decidable locally is decided first. A misconfigured recipient, a
- * missing key or an unwritable output directory is answered before a connection is opened, which
- * keeps the failure cheap and keeps the offline suites able to exercise these paths for real.
+ * EVERY EVALUABLE CHECK IS EVALUATED, because the expected stopping point of preparation is this
+ * report: an operator who still has to fund the payer, configure the recipient, or configure the
+ * issuer needs the payer address, the balance state and every other finding in one pass, not one
+ * failure per invocation. The one early return is a required-but-missing payer key, which leaves
+ * nothing payer-dependent evaluable and no address to fund. Locally decidable checks still run
+ * before any connection is opened.
  */
 export async function runPreflight(options: PreflightOptions): Promise<PreflightReport> {
   const checks = checkLocalConfiguration(options);
-  if (checks.some((c) => c.status === 'failed')) {
-    return { ready: false, checks };
+  if (options.issuer !== undefined) {
+    checks.push(...checkIssuerReadiness(options.issuer.configured, options.issuer.keyPath));
   }
 
   const keyPath = options.payerKeyPath ?? PAYER_KEY_PATH;
@@ -414,14 +519,20 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
     payerAddress = resolvePayerAccount(keyPath).address;
   }
 
-  // The recipient is an address by now: the local checks above refuse anything else and return
-  // before reaching here. These are the last things decidable without a connection, so they are
-  // decided before one is opened.
-  if (options.payTo === undefined) return { ready: false, checks, payerAddress };
-  checks.push(distinctRolesCheck(options.payTo, payerAddress));
+  const recipientUsable =
+    options.payTo !== undefined && checks.every((c) => c.name !== 'recipient is an EVM address' || c.status === 'ok');
+  if (recipientUsable && options.payTo !== undefined) {
+    checks.push(distinctRolesCheck(options.payTo, payerAddress));
+  } else {
+    checks.push(
+      notEvaluated('payer and recipient are distinct', 'no usable recipient is configured to compare against'),
+    );
+  }
   checks.push(reviewerMaterialWritableCheck(options.outDirectory));
-  if (checks.some((c) => c.status === 'failed')) return { ready: false, checks, payerAddress };
 
+  // The network checks still run when a local check failed: the report is the stopping point for
+  // an operator mid-preparation, and the balance and facilitator findings are exactly what they
+  // came for. Nothing past this report is reachable while any check is failed.
   checks.push(...(await checkChainState(payerAddress, options.asset, options.rpc)));
   checks.push(await checkFacilitatorSupport(options.facilitatorClient, options.network));
   return {
@@ -431,10 +542,12 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
   };
 }
 
-/** Prints a report. The payer address is public and is the one value a person needs to fund. */
+/**
+ * Prints a report. The payer address is public and is the one value a person needs to fund. The
+ * caller prints the heading and the safe configuration summary; this prints the findings.
+ */
 export function printReport(report: PreflightReport): void {
-  console.log('\nBase Sepolia preflight\n');
-  if (report.payerAddress !== undefined) console.log(`  payer address : ${report.payerAddress}\n`);
+  if (report.payerAddress !== undefined) console.log(`\n  payer address : ${report.payerAddress}\n`);
   for (const check of report.checks) {
     const mark =
       check.status === 'ok'
@@ -453,17 +566,74 @@ export function printReport(report: PreflightReport): void {
   console.log('\nReady. The live demonstration can run.\n');
 }
 
+/**
+ * The facilitator this example documents for Base Sepolia testing, which is also the pinned
+ * upstream client's own default. Overridable through `PEAC_EXAMPLE_FACILITATOR_URL`, and always
+ * constructed EXPLICITLY with the resolved URL, so what the run talks to is what the report
+ * printed rather than whatever a library default resolves to at call time.
+ */
+export const DEFAULT_FACILITATOR_URL = 'https://x402.org/facilitator';
+
+export const FACILITATOR_URL_ENV = 'PEAC_EXAMPLE_FACILITATOR_URL';
+export const RPC_URL_ENV = 'PEAC_EXAMPLE_RPC_URL';
+export const PAY_TO_ENV = 'PEAC_EXAMPLE_PAY_TO';
+
+/** The RPC endpoint a live command uses: the documented public endpoint, or the override. */
+export function resolvedRpcUrl(): string {
+  return process.env[RPC_URL_ENV] ?? BASE_SEPOLIA_RPC_URL;
+}
+
+/** The facilitator a live command uses: the documented testing default, or the override. */
+export function resolvedFacilitatorUrl(): string {
+  return process.env[FACILITATOR_URL_ENV] ?? DEFAULT_FACILITATOR_URL;
+}
+
+/**
+ * The safe configuration summary a live command prints: public addresses, identities the operator
+ * configured, and endpoint ORIGINS only. Never a private key, never a full endpoint URL (a path
+ * or query can carry a credential), and never an absolute local path.
+ */
+export function printSafeConfiguration(input: {
+  readonly rpcUrl: string;
+  readonly facilitatorUrl: string;
+  readonly asset: string | undefined;
+  readonly assetDecimals: number | undefined;
+  readonly amountBaseUnits: string;
+}): void {
+  console.log('  configuration (safe values only)');
+  console.log(`    network             : ${NETWORK} (Base Sepolia)`);
+  console.log(`    token contract      : ${input.asset ?? '(no upstream default asset entry)'}`);
+  console.log(
+    `    required amount     : ${input.amountBaseUnits} base units` +
+      (input.assetDecimals !== undefined ? ` (10^-${input.assetDecimals} USDC units)` : ''),
+  );
+  console.log(`    recipient           : ${process.env[PAY_TO_ENV] !== undefined ? process.env[PAY_TO_ENV] : `(unset; set ${PAY_TO_ENV})`}`);
+  console.log(`    issuer              : ${process.env[LIVE_ISSUER_ENV] !== undefined ? process.env[LIVE_ISSUER_ENV] : `(unset; set ${LIVE_ISSUER_ENV})`}`);
+  console.log(`    rpc endpoint origin : ${publicEndpointReference(input.rpcUrl) ?? '(not a usable http or https URL)'}`);
+  console.log(`    facilitator origin  : ${publicEndpointReference(input.facilitatorUrl) ?? '(not a usable http or https URL)'}`);
+}
+
 /** Entry point for `demo:live:prepare`. */
 export async function main(): Promise<void> {
   const { HTTPFacilitatorClient } = await import('@x402/core/server');
   const usdc = expectedUsdcAsset();
-  const rpcUrl = process.env['PEAC_EXAMPLE_RPC_URL'] ?? BASE_SEPOLIA_RPC_URL;
+  const rpcUrl = resolvedRpcUrl();
+  const facilitatorUrl = resolvedFacilitatorUrl();
   const report = await runPreflight({
     network: NETWORK,
-    payTo: process.env['PEAC_EXAMPLE_PAY_TO'],
+    payTo: process.env[PAY_TO_ENV],
     asset: usdc?.asset ?? '',
     rpc: jsonRpcChainState(rpcUrl),
-    facilitatorClient: new HTTPFacilitatorClient(),
+    facilitatorClient: new HTTPFacilitatorClient({ url: facilitatorUrl }),
+    issuer: { configured: process.env[LIVE_ISSUER_ENV] },
+  });
+  console.log('\nBase Sepolia preflight\n');
+  printSafeConfiguration({
+    rpcUrl,
+    facilitatorUrl,
+    asset: usdc?.asset,
+    assetDecimals: usdc?.decimals,
+    amountBaseUnits: AMOUNT_BASE_UNITS,
   });
   printReport(report);
   if (!report.ready) process.exit(1);

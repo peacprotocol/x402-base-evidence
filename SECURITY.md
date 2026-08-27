@@ -82,6 +82,12 @@ It still does not establish:
   additionally requires the expected token, from, to and value transfer event plus native x402
   validation.
 
+PEAC signature and integrity verification by itself does not establish onchain inclusion or
+finality. This example may retain a separately attributed RPC source's L2-inclusion observation
+after bounded consistency checks. The verifier establishes the integrity and internal consistency
+of that recorded observation; it does not independently establish blockchain consensus, external
+truth, issuer authority, client receipt or finality.
+
 Base distinguishes Flashblock preconfirmation, sealed L2 block inclusion, L1 batch inclusion and L1
 finality. The observation layer in this repository records sealed L2 block inclusion only, with the
 named source and the observation level actually established: the canonical observation never uses

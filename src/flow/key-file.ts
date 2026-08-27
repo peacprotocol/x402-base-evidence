@@ -19,9 +19,51 @@ import { parseStrictJson, type StrictJsonRefusal } from '../strict-json.ts';
 
 const APP_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
-/** Path as shown in messages: relative to the repository, so no local directory layout is printed. */
+/**
+ * Path as shown in messages: relative to the repository, so no local directory layout is printed.
+ *
+ * A path OUTSIDE the repository is never echoed at all — it names local filesystem layout that a
+ * diagnostic written to a terminal and pasted into run notes has no business publishing — so it is
+ * replaced by a fixed label. The person who configured the path knows which path they configured.
+ */
 export function displayKeyPath(path: string): string {
-  return path.startsWith(APP_ROOT) ? `.${path.slice(APP_ROOT.length)}` : path;
+  return path.startsWith(APP_ROOT) ? `.${path.slice(APP_ROOT.length)}` : 'the configured key path';
+}
+
+/**
+ * The errno names a filesystem diagnostic may repeat. An allowlist, not a formatter: a caught
+ * error's `message` embeds the absolute path it failed on, so no part of the message is ever
+ * echoed. What survives is the errno name alone, and only when it is one of these; anything else
+ * is reported as unrecognized rather than quoted.
+ */
+const ERRNO_ALLOWLIST = new Set([
+  'EACCES',
+  'EAGAIN',
+  'EBADF',
+  'EBUSY',
+  'EDQUOT',
+  'EEXIST',
+  'EFBIG',
+  'EIO',
+  'EISDIR',
+  'ELOOP',
+  'EMFILE',
+  'ENAMETOOLONG',
+  'ENFILE',
+  'ENOENT',
+  'ENOMEM',
+  'ENOSPC',
+  'ENOTDIR',
+  'ENXIO',
+  'EOPNOTSUPP',
+  'EPERM',
+  'EROFS',
+]);
+
+/** The bounded description of a caught filesystem error: an allowlisted errno name, or a fixed term. */
+export function boundedFsErrorName(e: unknown): string {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === 'string' && ERRNO_ALLOWLIST.has(code) ? code : 'unrecognized error';
 }
 
 /** An existing key file that could not be loaded. Never raised for a file that does not exist. */
@@ -61,7 +103,8 @@ export function readKeyFile(path: string): string | undefined {
     return readFileSync(path, 'utf8');
   } catch (e) {
     if (isFileNotFound(e)) return undefined;
-    refuseKeyFile(path, `it could not be read (${(e as Error).message.split('\n')[0]})`);
+    // The caught message embeds the absolute path it failed on; only the errno name survives.
+    refuseKeyFile(path, `it could not be read (${boundedFsErrorName(e)})`);
   }
 }
 
@@ -79,7 +122,11 @@ export function writeNewKeyFile(path: string, contents: string): void {
     if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
       refuseKeyFile(path, 'a key file appeared at this path and was not replaced');
     }
-    throw e;
+    // Never rethrown raw: the OS error's message embeds the absolute path it failed on, and this
+    // failure surfaces in command output. The errno name is the bounded fact worth reporting.
+    throw new Error(
+      `The key file at ${displayKeyPath(path)} could not be created (${boundedFsErrorName(e)}).`,
+    );
   }
 }
 
@@ -93,8 +140,10 @@ export function writeNewKeyFile(path: string, contents: string): void {
 export function parseKeyFileJson(path: string, text: string): unknown {
   try {
     return JSON.parse(text);
-  } catch (e) {
-    refuseKeyFile(path, `it is not valid JSON (${(e as Error).message.split('\n')[0]})`);
+  } catch {
+    // The parser's message quotes the text around the failure, which is file content; the fact
+    // that the file is not JSON is the whole of what this diagnostic needs to say.
+    refuseKeyFile(path, 'it is not valid JSON');
   }
 }
 
@@ -131,7 +180,8 @@ export function readAdmittedKeyFile(path: string): unknown {
     bytes = readFileSync(path);
   } catch (e) {
     if (isFileNotFound(e)) return undefined;
-    refuseKeyFile(path, `it could not be read (${(e as Error).message.split('\n')[0]})`);
+    // The caught message embeds the absolute path it failed on; only the errno name survives.
+    refuseKeyFile(path, `it could not be read (${boundedFsErrorName(e)})`);
   }
   const admitted = parseStrictJson(bytes);
   if (admitted.status === 'refused') refuseKeyFile(path, STRICT_REFUSALS[admitted.refusal]);
