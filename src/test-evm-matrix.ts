@@ -86,6 +86,7 @@ import {
   TRANSFER_EVENT_TOPIC,
   transfersOnContract,
   type ObservedLog,
+  type SealedRpcObservationV1,
   type SealedTransactionSource,
 } from './flow/observe-transaction.ts';
 import {
@@ -94,6 +95,7 @@ import {
   JsonRpcFailure,
   jsonRpcRequest,
 } from './flow/evm-json-rpc.ts';
+import { observeUntilSealed, type LiveObservationResult } from './flow/live-e2e.ts';
 import {
   checkChainState,
   checkIssuerReadiness,
@@ -1480,6 +1482,116 @@ interface RpcStubBehavior {
   }
 
   await new Promise<void>((resolve) => stub.close(() => resolve()));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The live observation loop, exercised deterministically with an injected clock and sleep. The
+// loop's contract: retry only transient states within the deadline; stop immediately on a
+// definitive admitted result; report honestly on expiry; never poll indefinitely.
+// ---------------------------------------------------------------------------------------------
+
+console.log('\n  -- live observation loop (injected clock; no waiting, no sockets) --');
+
+{
+  const expectedTransfer = {
+    token_contract: F.ASSET_CONTRACT,
+    transfer_from: F.PAYER,
+    transfer_to: F.PAY_TO,
+    transfer_amount: F.AMOUNT_BASE_UNITS,
+  };
+  const base = {
+    source: { kind: 'rpc' as const, reference: 'synthetic loop source' },
+    transaction_hash: F.SETTLEMENT_TX_HASH,
+    observed_at_unix_seconds: F.FIXED_NOW_UNIX_SECONDS,
+    statement: 'synthetic observation for the loop vectors',
+  };
+  const notFound: SealedRpcObservationV1 = { ...base, observation_state: 'not_found' };
+  const unavailable: SealedRpcObservationV1 = {
+    ...base,
+    observation_state: 'unavailable',
+    unavailable_reason: 'the endpoint could not be reached or did not answer in time',
+  };
+  const foundNoInclusion: SealedRpcObservationV1 = {
+    ...base,
+    observation_state: 'found',
+    receipt_status: 'success',
+  };
+  const reverted: SealedRpcObservationV1 = {
+    ...base,
+    observation_state: 'found',
+    receipt_status: 'reverted',
+  };
+  const matchingTransfer = {
+    token_contract: F.ASSET_CONTRACT,
+    transfer_from: F.PAYER,
+    transfer_to: F.PAY_TO,
+    transfer_amount: F.AMOUNT_BASE_UNITS,
+  };
+  const included = (transfer: typeof matchingTransfer | undefined): SealedRpcObservationV1 => ({
+    ...base,
+    observation_state: 'found',
+    observation_level: 'l2_block_inclusion',
+    receipt_status: 'success',
+    ...(transfer !== undefined ? { token_transfer: transfer } : {}),
+  });
+
+  const runLoop = async (
+    sequence: readonly SealedRpcObservationV1[],
+  ): Promise<{ result: LiveObservationResult; polls: number; slept: number[] }> => {
+    let clock = 0;
+    let polls = 0;
+    const slept: number[] = [];
+    const result = await observeUntilSealed({
+      observe: async () => {
+        const next = sequence[Math.min(polls, sequence.length - 1)];
+        polls += 1;
+        if (next === undefined) throw new Error('empty observation sequence');
+        return next;
+      },
+      nowMs: () => clock,
+      sleep: async (ms) => {
+        slept.push(ms);
+        clock += ms;
+      },
+      expectedTransfer,
+      pollMs: 2000,
+      deadlineMs: 10_000,
+    });
+    return { result, polls, slept };
+  };
+
+  const success = await runLoop([notFound, unavailable, foundNoInclusion, included(matchingTransfer)]);
+  check(
+    'transient states are retried and a fully matching sealed inclusion stops the loop as matched',
+    success.result.outcome === 'matched' && success.polls === 4,
+    `${success.result.outcome} after ${success.polls} polls`,
+  );
+  const revertedRun = await runLoop([notFound, reverted]);
+  check(
+    'a reverted execution stops the loop immediately as a definitive failure',
+    revertedRun.result.outcome === 'reverted' && revertedRun.polls === 2,
+    `${revertedRun.result.outcome} after ${revertedRun.polls} polls`,
+  );
+  const wrongTransfer = await runLoop([included({ ...matchingTransfer, transfer_amount: '1' })]);
+  check(
+    'an admitted sealed receipt with a definitively wrong transfer stops the loop as wrong_transfer',
+    wrongTransfer.result.outcome === 'wrong_transfer' && wrongTransfer.polls === 1,
+    `${wrongTransfer.result.outcome} after ${wrongTransfer.polls} polls`,
+  );
+  const absentTransfer = await runLoop([included(undefined)]);
+  check(
+    'an admitted sealed receipt without the expected transfer is wrong_transfer, never a pass',
+    absentTransfer.result.outcome === 'wrong_transfer',
+    absentTransfer.result.outcome,
+  );
+  const expiry = await runLoop([notFound]);
+  check(
+    'the deadline bounds the loop: an unestablished observation ends as not_established, not a wait',
+    expiry.result.outcome === 'not_established' &&
+      expiry.slept.every((ms) => ms === 2000) &&
+      expiry.slept.reduce((a, b) => a + b, 0) <= 10_000,
+    `${expiry.result.outcome} after ${expiry.polls} polls, slept ${expiry.slept.reduce((a, b) => a + b, 0)}ms`,
+  );
 }
 
 // ---------------------------------------------------------------------------------------------

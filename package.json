@@ -15,6 +15,7 @@
     "demo:fixture": "tsx src/flow/fixture-e2e.ts",
     "demo:offline": "tsx src/fixture-demo-offline.ts",
     "demo:live:prepare": "tsx src/flow/preflight.ts",
+    "demo:live": "tsx src/flow/live-e2e.ts",
     "verify": "tsx src/flow/verify-evidence.ts",
     "tamper-demo": "tsx src/flow/tamper-demo.ts",
     "test": "pnpm test:reset && pnpm test:imports && pnpm test:golden && pnpm test:negative && pnpm test:ledger-integrity && pnpm test:flow && pnpm test:flow:node && pnpm test:evm && pnpm test:acceptance && pnpm typecheck && pnpm typecheck:compat",

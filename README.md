@@ -9,8 +9,12 @@ PEAC record issuance over the resulting digests, and offline verification of tha
 supplied public key, with a deterministic validation corpus and a byte-reproducible offline
 end-to-end fixture.
 
-This revision is validated through the deterministic offline flow and does not include a live Base
-Sepolia execution; see [§4 Current implementation status](#4-current-implementation-status).
+This revision is validated through the deterministic offline flow. A Base Sepolia live acceptance
+runner (`pnpm demo:live`) and its preflight (`pnpm demo:live:prepare`) are implemented, and NO
+live execution has been performed or recorded yet: no output in this repository may be presented
+as a payment having been made. See
+[§4 Current implementation status](#4-current-implementation-status) and
+[§5.1 Live run](#51-live-run-base-sepolia).
 
 Independent open-source reference implementation; not an endorsement or official implementation of
 Base, Coinbase, the x402 Foundation, Circle, or any facilitator.
@@ -118,7 +122,7 @@ disagreement, not resolved into either side being authoritative.
 | end-to-end payment flow | implemented; exercised offline against an in-process facilitator |
 | PEAC signed record issuance and offline verification | implemented |
 | settlement observation layer (sealed-L2 contract) | implemented; exercised against synthetic sealed sources |
-| live Base Sepolia execution and live settlement observation | outside this revision; the flow is validated offline |
+| live Base Sepolia execution and live settlement observation | runner and preflight implemented ([§5.1](#51-live-run-base-sepolia)); no live execution has been performed or recorded yet |
 | x402 signed offers and receipts | preserved when present inside captured field values; not enabled in the deterministic fixture (see [§9](#9-relationship-to-peac-x402-and-base)) |
 | scheme `upto` | out of scope |
 | batch settlement | out of scope |
@@ -164,7 +168,8 @@ pnpm demo:offline                # binding walkthrough with egress diagnostics i
 pnpm verify                      # offline verification: files and a public key, nothing else
 pnpm verify -- --evidence <dir> --public-key <file>   # verify any evidence directory
 pnpm tamper-demo                 # one edited field, one named failure
-pnpm demo:live:prepare           # Base Sepolia preflight (the only network-using command)
+pnpm demo:live:prepare           # Base Sepolia preflight; the expected stop before funding
+pnpm demo:live                   # ONE live paid request on Base Sepolia (see 5.1; spends test USDC)
 pnpm gen:golden                  # regenerate the vectors, then review the diff
 ```
 
@@ -183,6 +188,39 @@ TEST-ONLY fixture keys — the fixture issuer key that signs the committed recor
 EVM test keys used so the installed upstream signature validation runs over real signatures. They
 are permanently public, never funded, never reused outside these fixtures, and never credentials or
 trust anchors; see [`SECURITY.md`](SECURITY.md).
+
+### 5.1 Live run (Base Sepolia)
+
+The live path has two commands and a deliberate human boundary between them.
+
+`pnpm demo:live:prepare` is the only network-using preparation command. It creates the payer key
+on first run (gitignored, never printed; only the public address is displayed), then checks
+everything a live run needs and prints one report: chain id, payer USDC balance, recipient and
+issuer configuration, issuer-key binding, facilitator capability (`exact` on `eip155:84532`),
+and evidence-directory writability. **Stopping here to fund the payer and set the configuration
+is the expected successful stopping point.** It spends nothing.
+
+Configuration is explicit; the live path has no fallbacks:
+
+| Variable | Meaning |
+|---|---|
+| `PEAC_EXAMPLE_PAY_TO` | REQUIRED. A Base Sepolia address the operator controls, receiving the payment. There is no default and no fallback to the synthetic fixture recipient. This example does NOT prove control of the address; supplying an address the operator controls is the operator's responsibility. |
+| `PEAC_EXAMPLE_ISSUER` | REQUIRED. Absolute `http`/`https` URL naming the party issuing the records. There is no default issuer; an existing issuer key bound to a different issuer stops the run with the key untouched. |
+| `PEAC_EXAMPLE_RPC_URL` | Optional. Defaults to the documented public endpoint `https://sepolia.base.org`, which is a rate-limited demonstration endpoint; operators with their own endpoint should set this. Only the ORIGIN of the URL is ever printed or recorded. |
+| `PEAC_EXAMPLE_FACILITATOR_URL` | Optional. Defaults to `https://x402.org/facilitator` for Base Sepolia testing. Constructed explicitly, never inferred. |
+
+The payer needs Base Sepolia test USDC only (no ETH: under EIP-3009 the facilitator broadcasts
+and pays gas). Fund the printed payer address from a public testnet faucet.
+
+`pnpm demo:live` re-runs the same preflight, refuses to proceed unless every check passes, and
+then performs ONE paid request: real EIP-3009 authorization, facilitator verification and
+settlement, origin result, and a bounded sealed-L2 observation of the settlement transaction
+through the configured RPC endpoint (fixed ~2s cadence within a fixed total deadline; only
+transient states are retried; `pending` is never used; no L1 or confirmation-count claims). The
+evidence directory is written transactionally under `out/`, verified offline before it is
+finalized, and a tamper demonstration proves that one altered byte in a copy fails verification.
+The strongest claim a passing run makes: the named Base RPC source reported the transaction in a
+sealed L2 block, and the admitted receipt contained the expected token transfer.
 
 ## 6. Validation and acceptance model
 
