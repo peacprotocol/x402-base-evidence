@@ -14,12 +14,11 @@
  *
  * The payer key is created once and reused; how it is stored and reloaded lives in `payer-key.ts`.
  *
- * WHAT THE PAYER NEEDS, AND WHAT IT DOES NOT. The payer needs Base Sepolia test USDC. It does not
- * need ETH, and this preflight does not require any: under the EIP-3009 asset-transfer method the
- * payer signs an authorization off-chain and the facilitator broadcasts the transaction that
- * consumes it, paying its gas as a structural consequence of being the broadcaster. Who broadcast
- * is recorded in the evidence as `transaction_sender`, an observed fact; no role beyond having
- * broadcast is inferred from it.
+ * WHAT THE PAYER NEEDS, AND WHAT IT DOES NOT. In this x402 facilitator flow, the facilitator
+ * submits the authorized transaction and pays gas. The payer therefore needs only Base Sepolia
+ * test USDC, and this preflight requires no ETH: the payer signs an EIP-3009 authorization
+ * off-chain and never broadcasts anything itself. Who broadcast is recorded in the evidence as
+ * `transaction_sender`, an observed fact; no role beyond having broadcast is inferred from it.
  *
  * EVIDENCE OUTPUT COMES BEFORE FUNDS. The last local check proves the `out/` directory a run
  * writes its evidence and verification material into is writable, before any payment is
@@ -61,12 +60,24 @@ export const BASE_SEPOLIA_RPC_URL = 'https://sepolia.base.org';
 /** The chain identifier the RPC endpoint must report for `eip155:84532`. */
 export const BASE_SEPOLIA_CHAIN_ID = 84532n;
 
-/** Enough test USDC to pay the demonstration price several times over. */
-export const MIN_USDC_BASE_UNITS = 1_000_000n;
+/**
+ * The balance the preflight requires: EXACTLY the intended spend, in base units, derived from the
+ * same fixture constant the payment itself uses so the two cannot drift.
+ *
+ * Least privilege, with no buffer: neither the x402 exact scheme nor the facilitator imposes any
+ * balance requirement beyond the authorization's own value (the EIP-3009 `transferWithAuthorization`
+ * moves exactly `value`, and the facilitator pays the gas), so requiring more than the run will
+ * spend would only instruct operators to park test funds on a demonstration key for no measured
+ * technical reason. The client additionally caps what it will sign for at this same amount
+ * through its spend controls, so the balance decides whether settlement can succeed while the cap
+ * decides what the client is willing to authorize.
+ */
+export const MIN_USDC_BASE_UNITS = BigInt(AMOUNT_BASE_UNITS);
 
 export const FUNDING_INSTRUCTIONS = [
   'Test USDC: request Base Sepolia USDC for the payer address from a public testnet faucet.',
-  'ETH is not required: the facilitator broadcasts the transaction under EIP-3009.',
+  'ETH is not required: in this x402 facilitator flow, the facilitator submits the authorized',
+  'transaction and pays gas, so the payer needs only Base Sepolia test USDC.',
   'Recipient: set PEAC_EXAMPLE_PAY_TO to a Base Sepolia address the operator controls.',
   'Issuer: set PEAC_EXAMPLE_ISSUER to the absolute http or https URL of the issuing party.',
 ].join('\n  ');
@@ -578,14 +589,73 @@ export const FACILITATOR_URL_ENV = 'PEAC_EXAMPLE_FACILITATOR_URL';
 export const RPC_URL_ENV = 'PEAC_EXAMPLE_RPC_URL';
 export const PAY_TO_ENV = 'PEAC_EXAMPLE_PAY_TO';
 
-/** The RPC endpoint a live command uses: the documented public endpoint, or the override. */
-export function resolvedRpcUrl(): string {
-  return process.env[RPC_URL_ENV] ?? BASE_SEPOLIA_RPC_URL;
+/**
+ * A configured endpoint that cannot be admitted. The message names the environment variable and
+ * the rule that refused it, and NEVER echoes the configured value: a refused endpoint string can
+ * carry a credential, and this message is printed to terminals and pasted into run notes.
+ */
+export class EndpointConfigurationError extends Error {}
+
+/** Hosts this example treats as loopback, where plain http is acceptable for local fixtures. */
+const LOOPBACK_HOST = /^(localhost|127(?:\.\d{1,3}){3}|::1)$/;
+
+/**
+ * Admit a configured endpoint URL, or refuse it with a bounded reason.
+ *
+ * Example-local admission for the two endpoint variables this example reads, not a general
+ * request-safety layer: the value must parse as an absolute URL, must use `https:` for any
+ * non-loopback host (`http:` is admitted for loopback only, which is what the fixture and local
+ * development paths use), must carry no embedded credentials, and no other scheme is admitted.
+ * The value itself is never echoed on refusal; only the variable name and the violated rule are.
+ */
+export function admitEndpointUrl(name: string, value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new EndpointConfigurationError(`${name} is not an absolute URL`);
+  }
+  if (url.username !== '' || url.password !== '') {
+    throw new EndpointConfigurationError(`${name} must not carry embedded credentials`);
+  }
+  if (url.protocol === 'https:') return value;
+  if (url.protocol === 'http:') {
+    if (LOOPBACK_HOST.test(url.hostname)) return value;
+    throw new EndpointConfigurationError(`${name} must use https for a non-loopback host`);
+  }
+  throw new EndpointConfigurationError(`${name} must be an http or https URL`);
 }
 
-/** The facilitator a live command uses: the documented testing default, or the override. */
+/** The RPC endpoint a live command uses: the documented public endpoint, or the admitted override. */
+export function resolvedRpcUrl(): string {
+  return admitEndpointUrl(RPC_URL_ENV, process.env[RPC_URL_ENV] ?? BASE_SEPOLIA_RPC_URL);
+}
+
+/** The facilitator a live command uses: the documented testing default, or the admitted override. */
 export function resolvedFacilitatorUrl(): string {
-  return process.env[FACILITATOR_URL_ENV] ?? DEFAULT_FACILITATOR_URL;
+  return admitEndpointUrl(
+    FACILITATOR_URL_ENV,
+    process.env[FACILITATOR_URL_ENV] ?? DEFAULT_FACILITATOR_URL,
+  );
+}
+
+/**
+ * Resolve both live endpoints, or stop with the bounded refusal and no stack trace.
+ *
+ * Entry points use this instead of calling the resolvers directly so a refused configuration
+ * prints one line naming the variable and the rule — never the configured value, and never a
+ * stack trace carrying absolute local paths.
+ */
+export function resolveEndpointsOrExit(): { rpcUrl: string; facilitatorUrl: string } {
+  try {
+    return { rpcUrl: resolvedRpcUrl(), facilitatorUrl: resolvedFacilitatorUrl() };
+  } catch (e) {
+    if (e instanceof EndpointConfigurationError) {
+      console.error(`\nFAIL  ${e.message}\n`);
+      process.exit(1);
+    }
+    throw e;
+  }
 }
 
 /**
@@ -617,8 +687,7 @@ export function printSafeConfiguration(input: {
 export async function main(): Promise<void> {
   const { HTTPFacilitatorClient } = await import('@x402/core/server');
   const usdc = expectedUsdcAsset();
-  const rpcUrl = resolvedRpcUrl();
-  const facilitatorUrl = resolvedFacilitatorUrl();
+  const { rpcUrl, facilitatorUrl } = resolveEndpointsOrExit();
   const report = await runPreflight({
     network: NETWORK,
     payTo: process.env[PAY_TO_ENV],

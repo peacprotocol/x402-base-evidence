@@ -8,7 +8,7 @@
  * origin-observed request and result bindings, the facilitator's settlement report, and a
  * SEPARATELY ATTRIBUTED Base Sepolia RPC observation of the settlement transaction. A signed PEAC
  * record covers the digests, the directory is verified offline before it is finalized, and a
- * tamper demonstration proves the verification actually fails when one bound byte changes.
+ * tamper demonstration shows the verification failing when one bound byte changes.
  *
  * WHAT THE OBSERVATION CLAIMS, AT MOST. The strongest claim a passing run makes is exactly this:
  * the named Base RPC source reported the transaction in a sealed L2 block, and the admitted
@@ -25,27 +25,25 @@
  * runner polls the configured Base Sepolia RPC on a fixed cadence within a fixed total deadline.
  * The cadence tracks the documented ~2s sealed-L2 block interval and the deadline is an
  * implementation decision of this example; neither is a claim about how fast the network seals.
- * Only transient states are retried (not found; endpoint temporarily unavailable; a receipt whose
- * sealed-block agreement has not yet been established). Definitive admitted results stop the loop
- * immediately: a reverted execution fails the acceptance, an admitted sealed receipt whose
- * expected transfer is definitively absent or different fails it, and a fully agreeing sealed-L2
- * inclusion with the expected transfer passes it. In every failing case the material is preserved
- * and written, because a failed live run is evidence too.
+ * Retryable and terminal states are classified explicitly, fail-closed: retried are exactly a
+ * transaction not yet found, a transport-level failure, an explicitly admitted temporary HTTP
+ * status, and a receipt whose sealed-block agreement has not yet been established. An RPC error,
+ * a structurally unusable response and every unclassified condition are terminal. Definitive
+ * admitted results stop the loop immediately: a reverted execution fails the acceptance, an
+ * admitted sealed receipt whose expected transfer is definitively absent or different fails it,
+ * and a fully agreeing sealed-L2 inclusion with the expected transfer passes it. Every terminal
+ * and exception path preserves the run material that safely exists at that point (see
+ * `executeLiveRun` below), and the failure-injection vectors in the EVM matrix are what make
+ * that sentence checkable rather than aspirational.
  */
-import { cpSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { HTTPFacilitatorClient } from '@x402/core/server';
-import type {
-  PaymentPayloadContext,
-  PaymentPayloadResult,
-  PaymentRequirements,
-  SchemeNetworkClient,
-} from '@x402/core/types';
+import type { BeforePaymentCreationHook, ClientExtension } from '@x402/core/client';
 import { ExactEvmScheme } from '@x402/evm/exact/client';
 import { registerExactEvmScheme } from '@x402/evm/exact/server';
-import type { ClientEvmSigner } from '@x402/evm';
 import {
   PAYMENT_IDENTIFIER,
   appendPaymentIdentifierToExtensions,
@@ -62,7 +60,9 @@ import {
   ORIGIN_RESULT_BODY,
 } from '../../fixtures/deterministic.ts';
 import { HASH32 } from './evm-json-rpc.ts';
+import { SUPPORTED_ASSET_TRANSFER_METHODS } from '../x402-header.ts';
 import { buildEvidence, RESOURCE_PATH, RESOURCE_QUERY, type RunResult } from './fixture-e2e.ts';
+import type { EvidenceLayout } from './issue-record.ts';
 import {
   prepareRunOutputs,
   runEvidenceDir,
@@ -76,6 +76,7 @@ import {
   baseSealedRpcSource,
   observeSealedTransaction,
   publicEndpointReference,
+  RETRYABLE_UNAVAILABLE_REASONS,
   transferMatchesExpected,
   type ExpectedTransfer,
   type SealedRpcObservationV1,
@@ -88,8 +89,7 @@ import {
   PAY_TO_ENV,
   printReport,
   printSafeConfiguration,
-  resolvedFacilitatorUrl,
-  resolvedRpcUrl,
+  resolveEndpointsOrExit,
   runPreflight,
 } from './preflight.ts';
 import { createPaidResource, type RequestObservation } from './server.ts';
@@ -112,37 +112,57 @@ export const LIVE_OBSERVATION_POLL_MS = 2_000;
 export const LIVE_OBSERVATION_DEADLINE_MS = 45_000;
 
 /**
- * The client-side wallet for the live run: the genuine upstream EVM exact scheme, signing with
- * the local payer key, plus the payment identifier appended through the upstream extension API.
- * The same one-interface seam the fixture wallet occupies, occupied by the real thing.
+ * The payment-identifier extension, injected through the upstream client-extension API.
+ *
+ * `x402Client.registerExtension` is the pinned upstream's own seam for enriching a payment
+ * payload's extension data after the scheme builds it, so no wrapper around the scheme client is
+ * needed for this. The upstream append helper reads the server's declaration out of the payload's
+ * merged extensions and appends the identifier only when the server declared support; when the
+ * server did not, the payload is returned unchanged, which is exactly the no-op behaviour the
+ * upstream contract asks of a declaration-gated client extension.
  */
-class LivePayerWallet implements SchemeNetworkClient {
-  readonly scheme = 'exact';
-  private readonly upstream: ExactEvmScheme;
-  private readonly paymentId: string;
+export function paymentIdentifierClientExtension(paymentId: string): ClientExtension {
+  return {
+    key: PAYMENT_IDENTIFIER,
+    enrichPaymentPayload: async (paymentPayload) => {
+      // A copy is enriched so no object shared with the decoded challenge is mutated in place.
+      const extensions = structuredClone(paymentPayload.extensions ?? {}) as Record<string, unknown>;
+      appendPaymentIdentifierToExtensions(extensions, paymentId);
+      return { ...paymentPayload, extensions };
+    },
+  };
+}
 
-  constructor(signer: ClientEvmSigner, paymentId: string) {
-    this.upstream = new ExactEvmScheme(signer);
-    this.paymentId = paymentId;
-  }
-
-  async createPaymentPayload(
-    x402Version: number,
-    paymentRequirements: PaymentRequirements,
-    context?: PaymentPayloadContext,
-  ): Promise<PaymentPayloadResult> {
-    const result = await this.upstream.createPaymentPayload(x402Version, paymentRequirements, context);
-    // The upstream helper appends only when the server declared the extension, and it writes into
-    // the declaration object it is given; a copy is passed so the server's own declaration is not
-    // mutated by a client running in the same process.
-    const declared = structuredClone(context?.extensions ?? {}) as Record<string, unknown>;
-    const appended = appendPaymentIdentifierToExtensions(declared, this.paymentId);
-    const extensions = { ...(result.extensions ?? {}), ...appended };
+/**
+ * Refuse to sign for any asset-transfer method outside this reference's EIP-3009 scope, at the
+ * moment the selection is known and BEFORE the payer signs anything.
+ *
+ * The check runs in the upstream `onBeforePaymentCreation` hook, which fires with the selected
+ * payment requirement before the scheme client builds or signs a payload. An explicit `eip3009`
+ * is accepted; an ABSENT method is accepted because the pinned upstream scheme routes an absent
+ * method to EIP-3009 (`paymentRequirements.extra?.assetTransferMethod ?? "eip3009"`, measured in
+ * the installed package); `permit2` and every unknown value are refused. Without this guard the
+ * upstream router would fall through to EIP-3009 signing for an unknown method value, signing a
+ * payload under a method the requirement never selected. Native x402 remains the authority on
+ * payment validity; this is local admission to the reference's declared scope.
+ */
+export function eip3009SelectionGuard(): BeforePaymentCreationHook {
+  return async (context) => {
+    const method = (
+      context.selectedRequirements.extra as { assetTransferMethod?: unknown } | undefined
+    )?.assetTransferMethod;
+    if (method === undefined) return undefined;
+    if (
+      typeof method === 'string' &&
+      (SUPPORTED_ASSET_TRANSFER_METHODS as readonly string[]).includes(method)
+    ) {
+      return undefined;
+    }
     return {
-      ...result,
-      ...(Object.keys(extensions).length > 0 ? { extensions } : {}),
+      abort: true,
+      reason: 'the selected requirement names an asset-transfer method outside the eip3009 scope of this reference',
     };
-  }
+  };
 }
 
 /** How the bounded observation loop ended. Every branch preserves the last observation made. */
@@ -193,14 +213,232 @@ export async function observeUntilSealed(input: {
       return { outcome: matched ? 'matched' : 'wrong_transfer', observation };
     }
 
-    // Everything else is transient for the purposes of this loop: not yet found, endpoint
-    // temporarily unavailable or answering unusably, or a receipt whose sealed-block agreement
-    // has not yet been established. Retry within the deadline; on expiry, report honestly that
-    // sealed inclusion was not established, with the last observation preserved.
+    if (observation.observation_state === 'unavailable') {
+      // Explicit terminal-versus-retryable classification, fail-closed. Retryable is exactly the
+      // transport failure and the explicitly admitted temporary HTTP statuses; an RPC error, a
+      // structurally unusable response, a malformed transaction reference, a local failure, and
+      // any reason this code does not recognize are terminal, reported honestly as
+      // not-established with the observation preserved. Asking again cannot make a malformed
+      // answer well-formed, and an unclassified condition is not retried into being transient.
+      const reason = observation.unavailable_reason;
+      if (reason === undefined || !RETRYABLE_UNAVAILABLE_REASONS.has(reason)) {
+        return { outcome: 'not_established', observation };
+      }
+    }
+
+    // What remains is transient for the purposes of this loop: not yet found, a retryable
+    // endpoint condition, or a receipt whose sealed-block agreement has not yet been established.
+    // Retry within the deadline; on expiry, report honestly that sealed inclusion was not
+    // established, with the last observation preserved.
     if (nowMs() - startedAt + pollMs > deadlineMs) {
       return { outcome: 'not_established', observation };
     }
     await sleep(pollMs);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Run-attempt durability across the irreversible payment boundary.
+//
+// THE INVARIANT: once creation and transmission of a live payment authorization can begin, every
+// subsequent terminal and exception path preserves the run material that safely exists at that
+// point, and no path ever attempts a second payment. The mechanism is example-local and small: a
+// run-attempt directory created BEFORE the payment with non-secret attempt metadata, and one
+// orchestrator that runs the phases in order and, on any throw, writes the bounded material it
+// holds into that directory before failing. Nothing here is a transaction system, an outbox or a
+// workflow engine; it is a directory, a JSON file, and a try/catch in the right place.
+// ---------------------------------------------------------------------------------------------
+
+/** Where a live run failed, from the orchestrator's own vantage point. */
+export type LiveRunStage =
+  | 'payment_exchange'
+  | 'rpc_observation'
+  | 'evidence_assembly'
+  | 'evidence_finalization';
+
+/**
+ * A live run that failed after the payment boundary was reachable.
+ *
+ * Carries the stage and NOTHING of the underlying error: an exception message can embed an
+ * absolute path, an OS error, or remote text, and this error's message is printed by the entry
+ * point and may be pasted into run notes. The preserved attempt directory is where the bounded
+ * material lives.
+ */
+export class LiveRunFailure extends Error {
+  readonly stage: LiveRunStage;
+  constructor(stage: LiveRunStage) {
+    super(
+      `the live run failed during ${stage}; the material that safely existed was preserved in ` +
+        'the run-attempt directory, and no second payment was attempted',
+    );
+    this.name = 'LiveRunFailure';
+    this.stage = stage;
+  }
+}
+
+/** The phases of one live run, injectable so failure at every boundary can be exercised. */
+export interface LiveRunPhases {
+  /** The one paid exchange. Called AT MOST ONCE; a failure is preserved, never retried. */
+  readonly payment: () => Promise<RunResult>;
+  readonly observe: (run: RunResult) => Promise<LiveObservationResult>;
+  readonly assemble: (run: RunResult, observed: LiveObservationResult) => Promise<EvidenceLayout>;
+  readonly finalize: (
+    layout: EvidenceLayout,
+    run: RunResult,
+    observed: LiveObservationResult,
+  ) => Promise<void>;
+}
+
+export interface LiveRunOutcome {
+  readonly run: RunResult;
+  readonly observed: LiveObservationResult;
+}
+
+const ATTEMPT_FILE = 'attempt.json';
+const RUN_MATERIAL_FILE = 'run-material.json';
+
+/** Visible-ASCII bound for preserved field values, matching the capture boundary's admission. */
+const PRESERVABLE_FIELD_VALUE = /^[\x21-\x7e]{1,16384}$/;
+
+const boundedFieldValue = (value: string | undefined): string | null =>
+  value !== undefined && PRESERVABLE_FIELD_VALUE.test(value) ? value : null;
+
+/**
+ * Create the run-attempt directory and record that a payment is about to become attemptable.
+ *
+ * Written BEFORE the payment phase, and holding ONLY non-secret metadata: identifiers, public
+ * addresses, endpoint origins and a timestamp. Never key material, never a full endpoint URL,
+ * never an absolute local path.
+ */
+export function beginLiveAttempt(input: {
+  readonly attemptDirectory: string;
+  readonly runId: string;
+  readonly metadata: Readonly<Record<string, string>>;
+}): void {
+  mkdirSync(input.attemptDirectory, { recursive: true });
+  writeFileSync(
+    join(input.attemptDirectory, ATTEMPT_FILE),
+    `${JSON.stringify(
+      {
+        note: 'Non-secret attempt record, written before any payment is attemptable.',
+        run_id: input.runId,
+        state: 'payment_attempt_begun',
+        started_at: new Date().toISOString(),
+        ...input.metadata,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+}
+
+function writeAttemptState(
+  attemptDirectory: string,
+  runId: string,
+  state: 'completed' | 'failed',
+  failedStage?: LiveRunStage,
+): void {
+  writeFileSync(
+    join(attemptDirectory, ATTEMPT_FILE),
+    `${JSON.stringify(
+      {
+        note:
+          state === 'completed'
+            ? 'The run completed and its evidence directory was finalized.'
+            : 'The run failed; the material that safely existed is preserved beside this file.',
+        run_id: runId,
+        state,
+        ...(failedStage !== undefined ? { failed_stage: failedStage } : {}),
+        recorded_at: new Date().toISOString(),
+      },
+      null,
+      2,
+    )}\n`,
+  );
+}
+
+/**
+ * Preserve what safely exists at the moment a live run fails.
+ *
+ * WHAT IS PRESERVED: bounded run facts (statuses, lifecycle states, the terminal state), the
+ * observed x402 field values from the origin's vantage point (wire artifacts, admitted under the
+ * same visible-ASCII size bound the capture boundary applies), the transaction reference only
+ * when it is a well-formed 32-byte hash, and the RPC observation exactly as made — never one
+ * fabricated for a phase that did not run. WHAT IS NEVER PRESERVED HERE: key material, raw
+ * exception text, remote response bodies, absolute paths.
+ */
+function preserveRunMaterial(
+  attemptDirectory: string,
+  stage: LiveRunStage,
+  run: RunResult | undefined,
+  observed: LiveObservationResult | undefined,
+): void {
+  const transaction = run?.origin.lifecycle.transaction;
+  const material = {
+    note: 'Material preserved from a live run that failed before its evidence was finalized.',
+    failed_stage: stage,
+    payment_exchange:
+      run === undefined
+        ? null
+        : {
+            unpaid_status: run.client.unpaidStatus,
+            paid_status: run.client.paidStatus,
+            lifecycle_states: [...run.origin.lifecycle.states],
+            terminal_state: run.terminalState,
+            transaction_reference:
+              transaction !== undefined && HASH32.test(transaction) ? transaction : null,
+            observed_fields: {
+              'payment-required': boundedFieldValue(
+                run.challenge.observedHeaders['payment-required'],
+              ),
+              'payment-signature': boundedFieldValue(
+                run.origin.observedHeaders['payment-signature'],
+              ),
+              'payment-response': boundedFieldValue(
+                run.origin.observedHeaders['payment-response'],
+              ),
+            },
+          },
+    rpc_observation: observed?.observation ?? null,
+    rpc_observation_outcome: observed?.outcome ?? null,
+  };
+  mkdirSync(attemptDirectory, { recursive: true });
+  writeFileSync(
+    join(attemptDirectory, RUN_MATERIAL_FILE),
+    `${JSON.stringify(material, null, 2)}\n`,
+  );
+}
+
+/**
+ * Run the live phases in order; on any throw, preserve and fail without a second payment.
+ *
+ * The payment phase is invoked exactly once by construction: it appears once, outside any loop
+ * and any catch, so no exception path can reach it a second time. Whatever phase throws, the
+ * material held at that point is written to the attempt directory, the attempt file records the
+ * failed stage, and a `LiveRunFailure` naming only the stage is thrown.
+ */
+export async function executeLiveRun(input: {
+  readonly phases: LiveRunPhases;
+  readonly attemptDirectory: string;
+  readonly runId: string;
+}): Promise<LiveRunOutcome> {
+  let stage: LiveRunStage = 'payment_exchange';
+  let run: RunResult | undefined;
+  let observed: LiveObservationResult | undefined;
+  try {
+    run = await input.phases.payment();
+    stage = 'rpc_observation';
+    observed = await input.phases.observe(run);
+    stage = 'evidence_assembly';
+    const layout = await input.phases.assemble(run, observed);
+    stage = 'evidence_finalization';
+    await input.phases.finalize(layout, run, observed);
+    writeAttemptState(input.attemptDirectory, input.runId, 'completed');
+    return { run, observed };
+  } catch {
+    preserveRunMaterial(input.attemptDirectory, stage, run, observed);
+    writeAttemptState(input.attemptDirectory, input.runId, 'failed', stage);
+    throw new LiveRunFailure(stage);
   }
 }
 
@@ -248,8 +486,21 @@ async function runLiveOnce(input: {
         baseUrl: `http://127.0.0.1:${port}`,
         network: NETWORK,
         registerSchemes: (c) => {
-          c.setSpendControls({ allowedAssets: [{ network: NETWORK, asset: input.asset }] });
-          c.register(NETWORK, new LivePayerWallet(input.payer, input.paymentId));
+          // The per-asset atomic cap makes the client refuse any requirement above the intended
+          // spend REGARDLESS of the payer's balance: the balance decides whether a payment can
+          // settle, the cap decides what this client is willing to sign for.
+          c.setSpendControls({
+            allowedAssets: [
+              { network: NETWORK, asset: input.asset, maxAmountPerPayment: AMOUNT_BASE_UNITS },
+            ],
+          });
+          // The genuine upstream EVM exact scheme signs with the local payer key; the payment
+          // identifier arrives through the upstream client-extension seam, and the selection
+          // guard refuses any asset-transfer method outside this reference's scope before
+          // anything is signed.
+          c.register(NETWORK, new ExactEvmScheme(input.payer));
+          c.registerExtension(paymentIdentifierClientExtension(input.paymentId));
+          c.onBeforePaymentCreation(eip3009SelectionGuard());
         },
       },
       `${RESOURCE_PATH}${RESOURCE_QUERY}`,
@@ -310,8 +561,7 @@ function liveRunNote(input: {
 /** Entry point for `demo:live`. Runs preflight first and refuses to pay from an unready state. */
 export async function main(): Promise<void> {
   const usdc = expectedUsdcAsset();
-  const rpcUrl = resolvedRpcUrl();
-  const facilitatorUrl = resolvedFacilitatorUrl();
+  const { rpcUrl, facilitatorUrl } = resolveEndpointsOrExit();
   const payTo = process.env[PAY_TO_ENV];
 
   console.log('\nBase Sepolia live acceptance run\n');
@@ -357,25 +607,9 @@ export async function main(): Promise<void> {
   console.log(`  evidence goes : ${runEvidenceDisplay(runId)}`);
   console.log(`  public key    : ${runPublicKeyDisplay(runId)}\n`);
 
-  // THE ONE LIVE PAYMENT.
+  // Live payment boundary: everything from here on can spend real test funds, so the run-attempt
+  // record is written FIRST, and every phase past it runs under the preserving orchestrator.
   const paymentId = generatePaymentId();
-  const run = await runLiveOnce({
-    payTo,
-    asset: usdc.asset,
-    facilitatorUrl,
-    payer,
-    paymentId,
-  });
-  console.log(`  unpaid status  : ${run.client.unpaidStatus}`);
-  console.log(`  paid status    : ${run.client.paidStatus}`);
-  console.log(`  lifecycle      : ${run.origin.lifecycle.states.join(' -> ')}`);
-  console.log(`  terminal state : ${run.terminalState}`);
-
-  const settled = run.terminalState === 'response_write_attempted';
-  const transactionHash = run.origin.lifecycle.transaction;
-
-  // The separately attributed RPC observation, only for a settlement the facilitator reported,
-  // and only through a transaction reference admitted as a 32-byte hash first.
   const rpcSource = baseSealedRpcSource(rpcUrl);
   const expectedTransfer: ExpectedTransfer = {
     token_contract: usdc.asset,
@@ -383,77 +617,131 @@ export async function main(): Promise<void> {
     transfer_to: payTo,
     transfer_amount: AMOUNT_BASE_UNITS,
   };
-  let observed: LiveObservationResult = { outcome: 'not_established' };
-  if (settled && transactionHash !== undefined && HASH32.test(transactionHash)) {
-    console.log(`\n  observing ${transactionHash} through ${rpcSource.reference} ...`);
-    observed = await observeUntilSealed({
-      observe: (observedAtUnixSeconds) =>
-        observeSealedTransaction({
-          source: rpcSource,
-          transactionHash,
+  const attemptDirectory = `${evidenceDirectory}-attempt`;
+  const attemptDisplay = `out/${runId}-attempt`;
+  beginLiveAttempt({
+    attemptDirectory,
+    runId,
+    metadata: {
+      network: NETWORK,
+      payer_address: payer.address,
+      recipient: payTo,
+      asset: usdc.asset,
+      amount_base_units: AMOUNT_BASE_UNITS,
+      facilitator_origin: publicEndpointReference(facilitatorUrl) ?? 'the configured facilitator',
+      rpc_origin: rpcSource.reference,
+    },
+  });
+
+  const isAccepted = (run: RunResult, observed: LiveObservationResult): boolean =>
+    run.terminalState === 'response_write_attempted' && observed.outcome === 'matched';
+
+  const phases: LiveRunPhases = {
+    payment: () => runLiveOnce({ payTo, asset: usdc.asset, facilitatorUrl, payer, paymentId }),
+
+    observe: async (run) => {
+      console.log(`  unpaid status  : ${run.client.unpaidStatus}`);
+      console.log(`  paid status    : ${run.client.paidStatus}`);
+      console.log(`  lifecycle      : ${run.origin.lifecycle.states.join(' -> ')}`);
+      console.log(`  terminal state : ${run.terminalState}`);
+
+      // The separately attributed RPC observation, only for a settlement the facilitator
+      // reported, and only through a transaction reference admitted as a 32-byte hash first.
+      const settled = run.terminalState === 'response_write_attempted';
+      const transactionHash = run.origin.lifecycle.transaction;
+      let observed: LiveObservationResult = { outcome: 'not_established' };
+      if (settled && transactionHash !== undefined && HASH32.test(transactionHash)) {
+        console.log(`\n  observing ${transactionHash} through ${rpcSource.reference} ...`);
+        observed = await observeUntilSealed({
+          observe: (observedAtUnixSeconds) =>
+            observeSealedTransaction({
+              source: rpcSource,
+              transactionHash,
+              expectedTransfer,
+              observedAtUnixSeconds,
+            }),
           expectedTransfer,
-          observedAtUnixSeconds,
-        }),
-      expectedTransfer,
-    });
-    console.log(`  observation outcome: ${observed.outcome}`);
-    if (observed.observation !== undefined) console.log(`  ${observed.observation.statement}`);
-  } else if (settled) {
-    console.log('\n  the settlement response carried no 32-byte transaction reference; no RPC observation was made');
-  }
-
-  // Evidence is written whatever the outcome: a failed live run is evidence too. The record binds
-  // the components the origin observed for the request that actually happened.
-  const components = run.origin.components;
-  if (components === undefined) throw new Error('the origin recorded no request components for the paid request');
-  const layout = await buildEvidence(run, {
-    mode: 'live',
-    requestIdentity: { kind: 'observed', components },
-    requestBody: new Uint8Array(0),
-    observedAtUnixSeconds: Math.floor(Date.now() / 1000),
-    observationSource: {
-      kind: 'facilitator',
-      reference: publicEndpointReference(facilitatorUrl) ?? 'the configured facilitator',
-    },
-    ...(observed.observation !== undefined ? { rpcObservation: observed.observation } : {}),
-    assetDecimals: usdc.decimals,
-    paymentReference: paymentId,
-    currency: 'USDC',
-    // The registered commerce `env` field: Base Sepolia is a test network, so the record says so.
-    environment: 'test',
-  });
-
-  const accepted = settled && observed.outcome === 'matched';
-  await writeEvidenceTransactionally({
-    finalDirectory: evidenceDirectory,
-    layout,
-    finalize: async (staged) => {
-      const verification = await verifyEvidence(staged, issuerKey.publicKey);
-      writeFileSync(
-        join(staged, 'verification-report.txt'),
-        formatReport(runEvidenceDisplay(runId), verification).trimStart(),
-      );
-      writeFileSync(
-        join(staged, LIVE_RUN_NOTE),
-        liveRunNote({
-          runId,
-          rpcReference: rpcSource.reference,
-          observationStatement: observed.observation?.statement,
-          accepted,
-        }),
-      );
-      if (!verification.ok) {
-        throw new Error('the freshly issued evidence did not verify; the staged directory is preserved');
+        });
+        console.log(`  observation outcome: ${observed.outcome}`);
+        if (observed.observation !== undefined) console.log(`  ${observed.observation.statement}`);
+      } else if (settled) {
+        console.log('\n  the settlement response carried no 32-byte transaction reference; no RPC observation was made');
       }
+      return observed;
     },
-  });
+
+    // Evidence is assembled whatever the outcome: a failed live run is evidence too. The record
+    // binds the components the origin observed for the request that actually happened.
+    assemble: async (run, observed) => {
+      const components = run.origin.components;
+      if (components === undefined) {
+        throw new Error('the origin recorded no request components for the paid request');
+      }
+      return buildEvidence(run, {
+        mode: 'live',
+        requestIdentity: { kind: 'observed', components },
+        requestBody: new Uint8Array(0),
+        observedAtUnixSeconds: Math.floor(Date.now() / 1000),
+        observationSource: {
+          kind: 'facilitator',
+          reference: publicEndpointReference(facilitatorUrl) ?? 'the configured facilitator',
+        },
+        ...(observed.observation !== undefined ? { rpcObservation: observed.observation } : {}),
+        assetDecimals: usdc.decimals,
+        paymentReference: paymentId,
+        currency: 'USDC',
+        // The registered commerce `env` field: Base Sepolia is a test network, so the record says so.
+        environment: 'test',
+      });
+    },
+
+    finalize: async (layout, run, observed) => {
+      await writeEvidenceTransactionally({
+        finalDirectory: evidenceDirectory,
+        layout,
+        finalize: async (staged) => {
+          const verification = await verifyEvidence(staged, issuerKey.publicKey);
+          writeFileSync(
+            join(staged, 'verification-report.txt'),
+            formatReport(runEvidenceDisplay(runId), verification).trimStart(),
+          );
+          writeFileSync(
+            join(staged, LIVE_RUN_NOTE),
+            liveRunNote({
+              runId,
+              rpcReference: rpcSource.reference,
+              observationStatement: observed.observation?.statement,
+              accepted: isAccepted(run, observed),
+            }),
+          );
+          if (!verification.ok) {
+            throw new Error('the freshly issued evidence did not verify; the staged directory is preserved');
+          }
+        },
+      });
+    },
+  };
+
+  let liveOutcome: LiveRunOutcome;
+  try {
+    liveOutcome = await executeLiveRun({ phases, attemptDirectory, runId });
+  } catch (e) {
+    if (e instanceof LiveRunFailure) {
+      console.error(`\n${e.message}\n  attempt record : ${attemptDisplay}\n`);
+      process.exit(1);
+    }
+    throw e;
+  }
+  const { run, observed } = liveOutcome;
+  const settled = run.terminalState === 'response_write_attempted';
+  const accepted = isAccepted(run, observed);
   console.log(`\n  evidence written and verified offline: ${runEvidenceDisplay(runId)}`);
   console.log(
     `  verify again: pnpm verify -- --evidence ${runEvidenceDisplay(runId)} --public-key ${runPublicKeyDisplay(runId)}`,
   );
 
   // The tamper demonstration: one bound byte changes in a COPY, and verification must fail. The
-  // copy is a scratch artifact and is removed after the property is proven.
+  // copy is a scratch artifact and is removed after the property is demonstrated.
   const tamperDirectory = join(evidenceDirectory, '..', `${runId}-tamper-check`);
   cpSync(evidenceDirectory, tamperDirectory, { recursive: true });
   const tamperTarget = join(tamperDirectory, 'origin-result-body.bin');

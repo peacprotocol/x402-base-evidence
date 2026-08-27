@@ -80,6 +80,8 @@ import {
   baseSealedRpcSource,
   ENDPOINT_RPC_ERROR,
   ENDPOINT_RESPONSE_UNUSABLE,
+  ENDPOINT_TEMPORARILY_UNAVAILABLE,
+  ENDPOINT_UNREACHABLE,
   MALFORMED_TRANSACTION_REFERENCE,
   MAX_RECEIPT_LOGS,
   observeSealedTransaction,
@@ -94,15 +96,28 @@ import {
   admitRpcQuantity,
   JsonRpcFailure,
   jsonRpcRequest,
+  MAX_RPC_RESPONSE_BYTES,
 } from './flow/evm-json-rpc.ts';
-import { observeUntilSealed, type LiveObservationResult } from './flow/live-e2e.ts';
 import {
+  beginLiveAttempt,
+  eip3009SelectionGuard,
+  executeLiveRun,
+  LiveRunFailure,
+  observeUntilSealed,
+  paymentIdentifierClientExtension,
+  type LiveObservationResult,
+  type LiveRunPhases,
+} from './flow/live-e2e.ts';
+import {
+  admitEndpointUrl,
   checkChainState,
   checkIssuerReadiness,
   checkLocalConfiguration,
   distinctRolesCheck,
+  EndpointConfigurationError,
   expectedUsdcAsset,
   jsonRpcChainState,
+  MIN_USDC_BASE_UNITS,
   reviewerMaterialWritableCheck,
 } from './flow/preflight.ts';
 import {
@@ -617,15 +632,20 @@ const passed = (report: EvidenceVerificationReport, name: string): boolean =>
 console.log('\n  -- replay --');
 
 /**
- * EVM-REPLAY-001. The same authorization, presented twice.
+ * EVM-REPLAY-001. The same authorization, presented twice — under the payment-identifier
+ * extension's documented resource-server semantics, which this origin now implements.
  *
- * On the network a consumed EIP-3009 authorization cannot transfer twice; offline, the stand-in
- * facilitator refuses the second settlement so the branch is reachable at all. What is asserted is
- * the observed outcome: no second successful transfer, the repeat recorded as a settlement
- * failure. Which internal mechanism a real facilitator or the chain uses to enforce this is
- * deliberately not named, because this suite has no way to observe it.
+ * TWO DISTINCT REPLAYS EXIST, AND THEY MUST BEHAVE DIFFERENTLY. A retry carrying the SAME payment
+ * identifier and the same request is the extension's idempotent-retry case: the origin serves the
+ * cached settled result and processes no second payment, so the facilitator is asked to settle
+ * exactly once. A replay of the same AUTHORIZATION under a DIFFERENT payment identifier is not a
+ * retry — it is an independent payment attempt reusing consumed authorization material — and it
+ * must reach the facilitator and fail there, because on the network a consumed EIP-3009
+ * authorization cannot transfer twice. Which internal mechanism a real facilitator or the chain
+ * uses to enforce that is deliberately not named, because this suite has no way to observe it.
  */
 recordExecution('EVM-REPLAY-001');
+recordExecution('X402-VALID-003');
 {
   const origin = await startOrigin();
   try {
@@ -633,7 +653,12 @@ recordExecution('EVM-REPLAY-001');
     const { paymentRequired } = await challenge(origin, http);
     const payment = await http.createPaymentPayload(paymentRequired);
     const first = await present(origin, http, payment);
-    const second = await present(origin, http, payment);
+    const observationsBeforeReplay = origin.observations.length;
+    const firstBody = await fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: http.encodePaymentSignatureHeader(payment),
+    });
+    const replayedBytes = new Uint8Array(await firstBody.arrayBuffer());
 
     check(
       'the first settlement of an authorization succeeds',
@@ -641,6 +666,34 @@ recordExecution('EVM-REPLAY-001');
         first.observation.lifecycle.terminalState === 'response_write_attempted',
       `status ${first.status}, ${first.observation.lifecycle.terminalState}`,
     );
+    check(
+      'a retry with the same payment identifier and the same request is served the cached result',
+      firstBody.status === 200 && replayedBytes.length > 0,
+      `status ${firstBody.status}`,
+    );
+    check(
+      'the idempotent retry repeats the settlement response of the payment that actually happened',
+      firstBody.headers.get('payment-response') !== null &&
+        firstBody.headers.get('payment-response') ===
+          first.observation.observedHeaders['payment-response'],
+    );
+    check(
+      'the idempotent retry processes no second payment and records no second lifecycle',
+      origin.calls.settle === 1 &&
+        origin.calls.verify === 1 &&
+        origin.observations.length === observationsBeforeReplay,
+      `settle calls ${origin.calls.settle}, verify calls ${origin.calls.verify}`,
+    );
+
+    // The same consumed authorization under a DIFFERENT payment identifier: an independent
+    // attempt, not a retry. It passes the idempotency layer (different identifiers are
+    // independent) and the facilitator refuses the settlement.
+    const freshId = 'pay_00000000000000000000000000replay';
+    const reused: PaymentPayload = structuredClone(payment);
+    (reused.extensions as Record<string, { info: { id?: string } }>)[
+      'payment-identifier'
+    ]!.info.id = freshId;
+    const second = await present(origin, http, reused);
     check(
       'a repeated consumed authorization does not produce a second successful transfer',
       second.observation.lifecycle.terminalState === 'settlement_failed' &&
@@ -654,9 +707,94 @@ recordExecution('EVM-REPLAY-001');
       `status ${second.status}`,
     );
     check(
-      'both attempts reached the facilitator, so the refusal was a settlement decision',
+      'the independent attempt reached the facilitator, so the refusal was a settlement decision',
       origin.calls.settle === 2,
       `settle calls ${origin.calls.settle}`,
+    );
+
+    // Same identifier, DIFFERENT request: refused without reusing the cached result and without
+    // creating a payment — the 409-style refusal the extension's documentation specifies.
+    const conflicting = await fetch(
+      `${origin.baseUrl}${RESOURCE_PATH}?region=beta&units=metric`,
+      { method: 'GET', headers: http.encodePaymentSignatureHeader(payment) },
+    );
+    const conflictingBytes = new Uint8Array(await conflicting.arrayBuffer());
+    check(
+      'the same identifier naming a different request is refused, not served the cached result',
+      conflicting.status === 409 &&
+        Buffer.compare(Buffer.from(conflictingBytes), Buffer.from(replayedBytes)) !== 0 &&
+        origin.calls.settle === 2 &&
+        origin.calls.verify === 2,
+      `status ${conflicting.status}, settle calls ${origin.calls.settle}`,
+    );
+
+    // The declaration marks the identifier required: a payload without one is refused with 400
+    // before any verification, using the upstream requirement check.
+    const withoutIdentifier: PaymentPayload = structuredClone(payment);
+    delete (withoutIdentifier as { extensions?: unknown }).extensions;
+    const verifiesBefore = origin.calls.verify;
+    const missing = await fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: http.encodePaymentSignatureHeader(withoutIdentifier),
+    });
+    await missing.arrayBuffer();
+    check(
+      'a required payment identifier that is absent is refused with 400 before verification',
+      missing.status === 400 && origin.calls.verify === verifiesBefore,
+      `status ${missing.status}, verify calls ${origin.calls.verify}`,
+    );
+  } finally {
+    await origin.close();
+  }
+}
+
+// The cache never manufactures a settlement: a run whose settlement FAILED caches nothing, so a
+// retry with the same identifier and the same request goes through payment processing again
+// rather than being served a success that never happened.
+{
+  const origin = await startOrigin({ rejectSettlement: 'synthetic_settlement_refusal' });
+  try {
+    const http = upstreamClient();
+    const { paymentRequired } = await challenge(origin, http);
+    const payment = await http.createPaymentPayload(paymentRequired);
+    const first = await present(origin, http, payment);
+    const retry = await present(origin, http, payment);
+    check(
+      'a failed settlement caches nothing: the same-identifier retry is processed, not replayed',
+      first.observation.lifecycle.terminalState === 'settlement_failed' &&
+        retry.observation.lifecycle.terminalState === 'settlement_failed' &&
+        retry.status === 402 &&
+        origin.calls.settle === 2,
+      `first ${first.observation.lifecycle.terminalState}, retry status ${retry.status}, ` +
+        `settle calls ${origin.calls.settle}`,
+    );
+  } finally {
+    await origin.close();
+  }
+}
+
+// Distinct identifiers over distinct authorizations are fully independent: two settlements, two
+// written results, no cross-talk through the idempotency layer.
+{
+  const origin = await startOrigin();
+  try {
+    const http = upstreamClient();
+    const { paymentRequired } = await challenge(origin, http);
+    const base = await http.createPaymentPayload(paymentRequired);
+    const withFreshMaterial = (id: string, nonce: string): PaymentPayload => {
+      const cloned: PaymentPayload = structuredClone(base);
+      (cloned.payload as { authorization: { nonce: string } }).authorization.nonce = nonce;
+      (cloned.extensions as Record<string, { info: { id?: string } }>)[
+        'payment-identifier'
+      ]!.info.id = id;
+      return cloned;
+    };
+    const a = await present(origin, http, withFreshMaterial('pay_independent000000000a', `0x${'6a'.repeat(32)}`));
+    const b = await present(origin, http, withFreshMaterial('pay_independent000000000b', `0x${'6b'.repeat(32)}`));
+    check(
+      'distinct payment identifiers over distinct authorizations settle independently',
+      a.status === 200 && b.status === 200 && origin.calls.settle === 2,
+      `a ${a.status}, b ${b.status}, settle calls ${origin.calls.settle}`,
     );
   } finally {
     await origin.close();
@@ -1159,6 +1297,58 @@ console.log('\n  -- evidence: strict RPC admission --');
       refuses(receiptWith({ logs: [goodLog, { ...goodLog, topics: ['0x1234'] }] }), admitReceiptResult) &&
       refuses(receiptWith({ logs: [goodLog, { ...goodLog, data: '0xabc' }] }), admitReceiptResult),
   );
+
+  // Log placement fields, measured against the live Base Sepolia response shape (2026-08-27):
+  // logs there carry `removed`, `transactionHash`, `blockHash` and `blockNumber`. They are
+  // checked when present, never required, and each present field must agree with the receipt
+  // this claim rests on. A removed log can never satisfy the expected transfer: the receipt
+  // carrying one is refused whole rather than read around.
+  const otherHash = '0x'.padEnd(66, 'c');
+  const placedLog = {
+    ...goodLog,
+    removed: false,
+    transactionHash: F.SETTLEMENT_TX_HASH,
+    blockHash,
+    blockNumber: '0x384',
+  };
+  check(
+    'a log whose placement fields all agree with the receipt is admitted',
+    admitReceiptResult(receiptWith({ logs: [placedLog] }), F.SETTLEMENT_TX_HASH).logs.length === 1,
+  );
+  check(
+    'a log without placement fields is admitted: optional fields are never required',
+    admitReceiptResult(receiptWith({}), F.SETTLEMENT_TX_HASH).logs.length === 1,
+  );
+  check(
+    'a log marked removed refuses the receipt whole: it can never satisfy the expected transfer',
+    refuses(receiptWith({ logs: [{ ...placedLog, removed: true }] }), (v) =>
+      admitReceiptResult(v, F.SETTLEMENT_TX_HASH),
+    ),
+  );
+  check(
+    'a non-boolean removed member refuses the receipt',
+    refuses(receiptWith({ logs: [{ ...placedLog, removed: 'no' }] }), (v) =>
+      admitReceiptResult(v, F.SETTLEMENT_TX_HASH),
+    ),
+  );
+  check(
+    'a log naming a different transaction than the one queried refuses the receipt',
+    refuses(receiptWith({ logs: [{ ...placedLog, transactionHash: otherHash }] }), (v) =>
+      admitReceiptResult(v, F.SETTLEMENT_TX_HASH),
+    ),
+  );
+  check(
+    'a log naming a different block hash than the receipt refuses the receipt',
+    refuses(receiptWith({ logs: [{ ...placedLog, blockHash: otherHash }] }), (v) =>
+      admitReceiptResult(v, F.SETTLEMENT_TX_HASH),
+    ),
+  );
+  check(
+    'a log naming a different block number than the receipt refuses the receipt',
+    refuses(receiptWith({ logs: [{ ...placedLog, blockNumber: '0x385' }] }), (v) =>
+      admitReceiptResult(v, F.SETTLEMENT_TX_HASH),
+    ),
+  );
   check(
     'a transaction object with a malformed sender or placement is refused',
     refuses({ from: 'not-an-address', blockNumber: '0x384', blockHash }, admitTransactionResult) &&
@@ -1213,13 +1403,17 @@ interface RpcStubBehavior {
   const { port } = stub.address() as AddressInfo;
   const stubUrl = `http://127.0.0.1:${port}`;
 
-  const failureKind = async (): Promise<string> => {
+  const caughtFailure = async (): Promise<JsonRpcFailure | 'no-failure' | 'unclassified'> => {
     try {
       await jsonRpcRequest(stubUrl, 'eth_chainId', [], 2000);
       return 'no-failure';
     } catch (e) {
-      return e instanceof JsonRpcFailure ? e.kind : 'unclassified';
+      return e instanceof JsonRpcFailure ? e : 'unclassified';
     }
+  };
+  const failureKind = async (): Promise<string> => {
+    const failure = await caughtFailure();
+    return typeof failure === 'string' ? failure : failure.kind;
   };
 
   behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, result: '0x14a34' }) };
@@ -1232,15 +1426,84 @@ interface RpcStubBehavior {
     'a null result is returned as null: the not-found fact belongs to the caller',
     (await jsonRpcRequest(stubUrl, 'eth_getTransactionReceipt', [F.SETTLEMENT_TX_HASH], 2000)) === null,
   );
+
+  // Retryable-versus-terminal classification of HTTP statuses, fail-closed: exactly 429 and 503
+  // are the admitted temporary set, with only the safe status code retained; every other
+  // non-success status is terminal, because this example does not guess which server errors are
+  // transient.
   behavior = { status: 500 };
-  check('an HTTP error status is classified unreachable', (await failureKind()) === 'unreachable');
+  check('an HTTP 500 is terminal: structurally unusable, never retried', (await failureKind()) === 'unusable');
+  behavior = { status: 404 };
+  check('an HTTP 404 is terminal: structurally unusable, never retried', (await failureKind()) === 'unusable');
+  behavior = { status: 429 };
+  {
+    const failure = await caughtFailure();
+    check(
+      'an HTTP 429 is the admitted temporary condition: retryable, safe status code retained',
+      typeof failure !== 'string' &&
+        failure.kind === 'temporarily_unavailable' &&
+        failure.retryable === true &&
+        failure.httpStatus === 429,
+      JSON.stringify(failure),
+    );
+  }
+  behavior = { status: 503 };
+  {
+    const failure = await caughtFailure();
+    check(
+      'an HTTP 503 is the admitted temporary condition: retryable, safe status code retained',
+      typeof failure !== 'string' &&
+        failure.kind === 'temporarily_unavailable' &&
+        failure.retryable === true &&
+        failure.httpStatus === 503,
+      JSON.stringify(failure),
+    );
+  }
+
   behavior = { rawBody: 'not json at all' };
   check('a non-JSON body is structurally unusable', (await failureKind()) === 'unusable');
   behavior = { rawBody: '[]' };
   check('an array body is structurally unusable', (await failureKind()) === 'unusable');
+
+  // The JSON-RPC 2.0 error member is admitted before it is believed: an error object must be a
+  // non-null non-array object with an integer `code` and a string `message`; optional `data` is
+  // ignored. A malformed error member is a structurally unusable response, never an rpc_error.
   behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, error: { code: -32000, message: 'server text' } }) };
-  check('an error member alone is classified as an RPC error', (await failureKind()) === 'rpc_error');
-  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, result: '0x1', error: { code: -32000 } }) };
+  {
+    const failure = await caughtFailure();
+    check(
+      'a well-formed error member is an RPC error: terminal, integer code retained, no text kept',
+      typeof failure !== 'string' &&
+        failure.kind === 'rpc_error' &&
+        failure.retryable === false &&
+        failure.rpcErrorCode === -32000 &&
+        !failure.message.includes('server text'),
+      JSON.stringify(failure),
+    );
+  }
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, error: { code: -32005, message: 'limit', data: { retryAfter: 5 } } }) };
+  {
+    const failure = await caughtFailure();
+    check(
+      'an error member with optional data is still a well-formed RPC error; the data is ignored',
+      typeof failure !== 'string' && failure.kind === 'rpc_error' && failure.rpcErrorCode === -32005,
+      JSON.stringify(failure),
+    );
+  }
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, error: null }) };
+  check('a null error member is structurally unusable, not an RPC error', (await failureKind()) === 'unusable');
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, error: ['boom'] }) };
+  check('an array error member is structurally unusable, not an RPC error', (await failureKind()) === 'unusable');
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, error: 'boom' }) };
+  check('a string error member is structurally unusable, not an RPC error', (await failureKind()) === 'unusable');
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, error: { code: 'x', message: 'm' } }) };
+  check('a non-integer error code is structurally unusable, not an RPC error', (await failureKind()) === 'unusable');
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, error: { code: 1.5, message: 'm' } }) };
+  check('a fractional error code is structurally unusable, not an RPC error', (await failureKind()) === 'unusable');
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, error: { code: -32000 } }) };
+  check('an error member missing its message is structurally unusable', (await failureKind()) === 'unusable');
+
+  behavior = { envelope: (id) => ({ jsonrpc: '2.0', id, result: '0x1', error: { code: -32000, message: 'm' } }) };
   check(
     'result and error together are an ambiguity and fail closed as unusable',
     (await failureKind()) === 'unusable',
@@ -1251,6 +1514,26 @@ interface RpcStubBehavior {
   check('a wrong jsonrpc member fails closed as unusable', (await failureKind()) === 'unusable');
   behavior = { envelope: () => ({ jsonrpc: '2.0', id: 999, result: '0x1' }) };
   check('a response repeating the wrong id fails closed as unusable', (await failureKind()) === 'unusable');
+
+  // The response byte budget, exercised at its exact boundary through the real reader: a body at
+  // the budget is admitted, one byte over is refused whole as unusable — never truncated into a
+  // shorter response that might then parse.
+  {
+    const prefix = '{"jsonrpc":"2.0","id":1,"result":"0x14a34","pad":"';
+    const suffix = '"}';
+    const padTo = (total: number): string =>
+      `${prefix}${'a'.repeat(total - prefix.length - suffix.length)}${suffix}`;
+    behavior = { rawBody: padTo(MAX_RPC_RESPONSE_BYTES) };
+    check(
+      'a response body exactly at the byte budget is admitted',
+      (await jsonRpcRequest(stubUrl, 'eth_chainId', [], 10_000)) === '0x14a34',
+    );
+    behavior = { rawBody: padTo(MAX_RPC_RESPONSE_BYTES + 1) };
+    check(
+      'a response body one byte over the budget is refused whole as unusable',
+      (await failureKind()) === 'unusable',
+    );
+  }
 
   // The preflight balance read, end to end through the same envelope: a 32-byte zero-padded word
   // is a balance, and a quantity-shaped short value — the exact confusion this fixes — is not.
@@ -1506,11 +1789,12 @@ console.log('\n  -- live observation loop (injected clock; no waiting, no socket
     statement: 'synthetic observation for the loop vectors',
   };
   const notFound: SealedRpcObservationV1 = { ...base, observation_state: 'not_found' };
-  const unavailable: SealedRpcObservationV1 = {
+  const unavailableWith = (reason: string): SealedRpcObservationV1 => ({
     ...base,
     observation_state: 'unavailable',
-    unavailable_reason: 'the endpoint could not be reached or did not answer in time',
-  };
+    unavailable_reason: reason,
+  });
+  const unavailable = unavailableWith(ENDPOINT_UNREACHABLE);
   const foundNoInclusion: SealedRpcObservationV1 = {
     ...base,
     observation_state: 'found',
@@ -1592,6 +1876,273 @@ console.log('\n  -- live observation loop (injected clock; no waiting, no socket
       expiry.slept.reduce((a, b) => a + b, 0) <= 10_000,
     `${expiry.result.outcome} after ${expiry.polls} polls, slept ${expiry.slept.reduce((a, b) => a + b, 0)}ms`,
   );
+
+  // Terminal-versus-retryable classification of unavailable observations, fail-closed. The
+  // retryable set is exactly the transport failure and the admitted temporary condition; an RPC
+  // error, a structurally unusable response, a malformed reference and any unrecognized reason
+  // stop the loop immediately with the observation preserved.
+  const temporarilyUnavailable = await runLoop([
+    unavailableWith(ENDPOINT_TEMPORARILY_UNAVAILABLE),
+    included(matchingTransfer),
+  ]);
+  check(
+    'the admitted temporary endpoint condition is retried like a transport failure',
+    temporarilyUnavailable.result.outcome === 'matched' && temporarilyUnavailable.polls === 2,
+    `${temporarilyUnavailable.result.outcome} after ${temporarilyUnavailable.polls} polls`,
+  );
+  const rpcErrorStop = await runLoop([unavailableWith(ENDPOINT_RPC_ERROR), included(matchingTransfer)]);
+  check(
+    'an RPC error is terminal: the loop stops immediately as not_established, never retries into it',
+    rpcErrorStop.result.outcome === 'not_established' &&
+      rpcErrorStop.polls === 1 &&
+      rpcErrorStop.result.observation?.unavailable_reason === ENDPOINT_RPC_ERROR,
+    `${rpcErrorStop.result.outcome} after ${rpcErrorStop.polls} polls`,
+  );
+  const unusableStop = await runLoop([
+    unavailableWith(ENDPOINT_RESPONSE_UNUSABLE),
+    included(matchingTransfer),
+  ]);
+  check(
+    'a structurally unusable response is terminal: asking again cannot make it well-formed',
+    unusableStop.result.outcome === 'not_established' && unusableStop.polls === 1,
+    `${unusableStop.result.outcome} after ${unusableStop.polls} polls`,
+  );
+  const malformedStop = await runLoop([
+    unavailableWith(MALFORMED_TRANSACTION_REFERENCE),
+    included(matchingTransfer),
+  ]);
+  check(
+    'a malformed transaction reference is terminal: no endpoint was queried and none will be',
+    malformedStop.result.outcome === 'not_established' && malformedStop.polls === 1,
+    `${malformedStop.result.outcome} after ${malformedStop.polls} polls`,
+  );
+  const unknownReasonStop = await runLoop([
+    unavailableWith('a reason this code has never declared'),
+    included(matchingTransfer),
+  ]);
+  check(
+    'an unrecognized unavailable reason is terminal: fail closed, never retried on unfamiliarity',
+    unknownReasonStop.result.outcome === 'not_established' && unknownReasonStop.polls === 1,
+    `${unknownReasonStop.result.outcome} after ${unknownReasonStop.polls} polls`,
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Live-run durability: once a payment can begin, every failing path preserves the material that
+// safely exists and never attempts a second payment. Exercised through the real orchestrator
+// with injected phases; the payment exchange, where one is needed, is the genuine offline
+// fixture run, so preserved material is real material.
+// ---------------------------------------------------------------------------------------------
+
+console.log('\n  -- live-run durability across the payment boundary --');
+
+{
+  const matchedObservation: LiveObservationResult = {
+    outcome: 'matched',
+    observation: {
+      source: { kind: 'rpc', reference: 'synthetic durability source' },
+      transaction_hash: F.SETTLEMENT_TX_HASH,
+      observation_state: 'found',
+      observation_level: 'l2_block_inclusion',
+      receipt_status: 'success',
+      observed_at_unix_seconds: F.FIXED_NOW_UNIX_SECONDS,
+      statement: 'synthetic observation for the durability vectors',
+    },
+  };
+  const readJson = (directory: string, file: string): Record<string, unknown> =>
+    JSON.parse(readFileSync(join(directory, file), 'utf8')) as Record<string, unknown>;
+  const noLeaks = (directory: string, file: string): boolean => {
+    const text = readFileSync(join(directory, file), 'utf8');
+    return (
+      !text.includes('privateKeyHex') &&
+      !text.includes(tmpdir()) &&
+      !text.includes(process.cwd()) &&
+      !text.includes('/Users/')
+    );
+  };
+
+  interface InjectionVector {
+    readonly label: string;
+    readonly expectStage: string;
+    readonly phases: (counters: { payment: number }) => LiveRunPhases;
+    readonly expectRunPreserved: boolean;
+    readonly expectObservationPreserved: boolean;
+  }
+  const boom = async (): Promise<never> => {
+    throw new Error('synthetic injected failure');
+  };
+  const vectors: InjectionVector[] = [
+    {
+      // Payload creation fails before anything could settle: nothing to preserve beyond the
+      // attempt record, and above all no fabricated run facts and no fabricated observation.
+      label: 'a failure during payload creation, before settlement',
+      expectStage: 'payment_exchange',
+      phases: (c) => ({
+        payment: async () => {
+          c.payment += 1;
+          return boom();
+        },
+        observe: async () => matchedObservation,
+        assemble: async () => {
+          throw new Error('unreachable');
+        },
+        finalize: async () => undefined,
+      }),
+      expectRunPreserved: false,
+      expectObservationPreserved: false,
+    },
+    {
+      // The exchange completed — settlement was observed, the origin response captured — and the
+      // run fails immediately after: the exchange facts and wire artifacts must survive.
+      label: 'a failure immediately after the settlement was observed',
+      expectStage: 'rpc_observation',
+      phases: (c) => ({
+        payment: async () => {
+          c.payment += 1;
+          return honestRun;
+        },
+        observe: boom,
+        assemble: async () => {
+          throw new Error('unreachable');
+        },
+        finalize: async () => undefined,
+      }),
+      expectRunPreserved: true,
+      expectObservationPreserved: false,
+    },
+    {
+      // The RPC observation was made and evidence assembly fails: the observation actually made
+      // is preserved exactly, never one fabricated for a phase that did not run.
+      label: 'a failure during evidence assembly, after the RPC observation',
+      expectStage: 'evidence_assembly',
+      phases: (c) => ({
+        payment: async () => {
+          c.payment += 1;
+          return honestRun;
+        },
+        observe: async () => matchedObservation,
+        assemble: boom,
+        finalize: async () => undefined,
+      }),
+      expectRunPreserved: true,
+      expectObservationPreserved: true,
+    },
+    {
+      // Finalization or offline verification fails: everything held at that point survives.
+      label: 'a failure during finalization and offline verification',
+      expectStage: 'evidence_finalization',
+      phases: (c) => ({
+        payment: async () => {
+          c.payment += 1;
+          return honestRun;
+        },
+        observe: async () => matchedObservation,
+        assemble: async () => honestLayout,
+        finalize: boom,
+      }),
+      expectRunPreserved: true,
+      expectObservationPreserved: true,
+    },
+  ];
+
+  for (const vector of vectors) {
+    const attemptDirectory = mkdtempSync(join(tmpdir(), 'peac-live-attempt-'));
+    temporaryDirectories.push(attemptDirectory);
+    const counters = { payment: 0 };
+    beginLiveAttempt({
+      attemptDirectory,
+      runId: 'injection-vector',
+      metadata: { network: F.NETWORK, payer_address: F.PAYER },
+    });
+    const before = readJson(attemptDirectory, 'attempt.json');
+    let failure: LiveRunFailure | undefined;
+    try {
+      await executeLiveRun({
+        phases: vector.phases(counters),
+        attemptDirectory,
+        runId: 'injection-vector',
+      });
+    } catch (e) {
+      if (e instanceof LiveRunFailure) failure = e;
+      else throw e;
+    }
+    const attempt = readJson(attemptDirectory, 'attempt.json');
+    const material = readJson(attemptDirectory, 'run-material.json');
+    const exchange = material['payment_exchange'] as Record<string, unknown> | null;
+    check(
+      `${vector.label}: fails as LiveRunFailure at the expected stage with the attempt recorded`,
+      failure !== undefined &&
+        failure.stage === vector.expectStage &&
+        before['state'] === 'payment_attempt_begun' &&
+        attempt['state'] === 'failed' &&
+        attempt['failed_stage'] === vector.expectStage,
+      `stage ${String(failure?.stage)}, attempt ${JSON.stringify(attempt)}`,
+    );
+    check(
+      `${vector.label}: the payment phase ran exactly once and was never retried`,
+      counters.payment === 1,
+      `payment calls ${counters.payment}`,
+    );
+    check(
+      `${vector.label}: the material that safely existed is preserved, and nothing is fabricated`,
+      (vector.expectRunPreserved
+        ? exchange !== null &&
+          exchange['terminal_state'] === 'response_write_attempted' &&
+          typeof (exchange['observed_fields'] as Record<string, unknown>)['payment-required'] ===
+            'string'
+        : exchange === null) &&
+        (vector.expectObservationPreserved
+          ? material['rpc_observation_outcome'] === 'matched' &&
+            (material['rpc_observation'] as Record<string, unknown>)['transaction_hash'] ===
+              F.SETTLEMENT_TX_HASH
+          : material['rpc_observation'] === null),
+      JSON.stringify(material).slice(0, 400),
+    );
+    check(
+      `${vector.label}: the preserved files carry no key material and no absolute paths`,
+      noLeaks(attemptDirectory, 'attempt.json') && noLeaks(attemptDirectory, 'run-material.json'),
+    );
+    check(
+      `${vector.label}: the failure message is bounded and names no underlying error text`,
+      failure !== undefined && !failure.message.includes('synthetic injected failure'),
+      String(failure?.message),
+    );
+  }
+
+  // The completing path: all phases succeed, the attempt record closes as completed, and no
+  // run-material file is written because nothing failed.
+  {
+    const attemptDirectory = mkdtempSync(join(tmpdir(), 'peac-live-attempt-'));
+    temporaryDirectories.push(attemptDirectory);
+    const counters = { payment: 0 };
+    beginLiveAttempt({
+      attemptDirectory,
+      runId: 'completion-vector',
+      metadata: { network: F.NETWORK },
+    });
+    const outcome = await executeLiveRun({
+      phases: {
+        payment: async () => {
+          counters.payment += 1;
+          return honestRun;
+        },
+        observe: async () => matchedObservation,
+        assemble: async () => honestLayout,
+        finalize: async () => undefined,
+      },
+      attemptDirectory,
+      runId: 'completion-vector',
+    });
+    const attempt = readJson(attemptDirectory, 'attempt.json');
+    check(
+      'a completing run closes its attempt record and preserves nothing as failure material',
+      outcome.observed.outcome === 'matched' &&
+        counters.payment === 1 &&
+        attempt['state'] === 'completed' &&
+        !existsSync(join(attemptDirectory, 'run-material.json')),
+      JSON.stringify(attempt),
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1635,6 +2186,133 @@ console.log('\n  -- preflight: local configuration --');
     'a payer that is also the recipient is refused as a demonstration invariant',
     distinctRolesCheck(F.PAY_TO, F.PAY_TO).status === 'failed' &&
       distinctRolesCheck(F.PAY_TO, F.PAYER).status === 'ok',
+  );
+}
+
+// The balance requirement is least-privilege: exactly the intended spend, derived from the same
+// fixture constant the payment uses, with no undocumented buffer. Exercised at its boundary.
+{
+  check(
+    'the required balance is exactly the intended spend, derived from the payment amount',
+    MIN_USDC_BASE_UNITS === BigInt(F.AMOUNT_BASE_UNITS),
+    `${MIN_USDC_BASE_UNITS} vs ${F.AMOUNT_BASE_UNITS}`,
+  );
+  const balanceRpc = (word: bigint): Parameters<typeof checkChainState>[2] => ({
+    chainId: async () => 84532n,
+    erc20Balance: async () => word,
+  });
+  const exact = await checkChainState(F.PAYER, F.ASSET_CONTRACT, balanceRpc(MIN_USDC_BASE_UNITS));
+  check(
+    'a balance exactly at the intended spend passes the balance check',
+    exact.some((c) => c.name === 'payer holds test USDC' && c.status === 'ok'),
+    JSON.stringify(exact),
+  );
+  const short = await checkChainState(
+    F.PAYER,
+    F.ASSET_CONTRACT,
+    balanceRpc(MIN_USDC_BASE_UNITS - 1n),
+  );
+  check(
+    'a balance one base unit short fails the balance check',
+    short.some((c) => c.name === 'payer holds test USDC' && c.status === 'failed'),
+    JSON.stringify(short),
+  );
+}
+
+// Endpoint admission for the two configurable endpoints: absolute URL, https for any
+// non-loopback host, loopback http admitted for local fixtures, no embedded credentials, no
+// other scheme — and the refused value itself is never echoed.
+{
+  const admits = (value: string): boolean => {
+    try {
+      return admitEndpointUrl('PEAC_EXAMPLE_RPC_URL', value) === value;
+    } catch {
+      return false;
+    }
+  };
+  const refusalMessage = (value: string): string => {
+    try {
+      admitEndpointUrl('PEAC_EXAMPLE_RPC_URL', value);
+      return '(admitted)';
+    } catch (e) {
+      return e instanceof EndpointConfigurationError ? e.message : '(unclassified)';
+    }
+  };
+  check(
+    'https endpoints and loopback http endpoints are admitted',
+    admits('https://sepolia.base.org') &&
+      admits('https://example.test/rpc') &&
+      admits('http://127.0.0.1:8545') &&
+      admits('http://localhost:8545'),
+  );
+  check(
+    'non-loopback http, embedded credentials, other schemes and relative values are refused',
+    !admits('http://rpc.example.test') &&
+      !admits('https://user:secret@rpc.example.test') &&
+      !admits('ftp://rpc.example.test') &&
+      !admits('file:///etc/hosts') &&
+      !admits('sepolia.base.org'),
+  );
+  const leaky = 'https://user:secret-credential@rpc.example.test/path?key=abc123';
+  const message = refusalMessage(leaky);
+  check(
+    'a refusal names the variable and the rule, never the configured value',
+    message.includes('PEAC_EXAMPLE_RPC_URL') &&
+      !message.includes('secret-credential') &&
+      !message.includes('rpc.example.test') &&
+      !message.includes('abc123'),
+    message,
+  );
+}
+
+// The client-side selection guard: EIP-3009 scope admission at the moment the requirement is
+// selected, BEFORE anything is signed, through the upstream onBeforePaymentCreation hook.
+recordExecution('X402-VALID-005');
+recordExecution('X402-REJECT-011');
+{
+  const clientWith = (extra?: Record<string, unknown>): { client: x402Client; paymentRequired: PaymentRequired } => {
+    const client = new x402Client();
+    client.setSpendControls({ allowedAssets: [{ network: F.NETWORK, asset: F.ASSET_CONTRACT }] });
+    client.register(F.NETWORK, new FixtureExactWallet());
+    client.registerExtension(paymentIdentifierClientExtension(F.PAYMENT_ID));
+    client.onBeforePaymentCreation(eip3009SelectionGuard());
+    const paymentRequired: PaymentRequired = structuredClone(F.PAYMENT_REQUIRED);
+    if (extra !== undefined) {
+      paymentRequired.accepts[0]!.extra = { ...paymentRequired.accepts[0]!.extra, ...extra };
+    }
+    return { client, paymentRequired };
+  };
+  const creates = async (extra?: Record<string, unknown>): Promise<PaymentPayload | undefined> => {
+    const { client, paymentRequired } = clientWith(extra);
+    try {
+      return await client.createPaymentPayload(paymentRequired);
+    } catch {
+      return undefined;
+    }
+  };
+  const absent = await creates();
+  check(
+    'an absent asset-transfer method is accepted: the pinned upstream routes it to eip3009',
+    absent !== undefined,
+  );
+  check(
+    'the payment identifier is injected through the upstream extension seam, gated on the declaration',
+    absent !== undefined &&
+      (absent.extensions as Record<string, { info?: { id?: string } }>)['payment-identifier']
+        ?.info?.id === F.PAYMENT_ID,
+    JSON.stringify(absent?.extensions ?? null),
+  );
+  check(
+    'an explicit eip3009 selection is accepted',
+    (await creates({ assetTransferMethod: 'eip3009' })) !== undefined,
+  );
+  check(
+    'a permit2 selection is refused before the payer signs anything',
+    (await creates({ assetTransferMethod: 'permit2' })) === undefined,
+  );
+  check(
+    'an unknown asset-transfer method is refused rather than falling through to eip3009 signing',
+    (await creates({ assetTransferMethod: 'erc7710' })) === undefined,
   );
 }
 

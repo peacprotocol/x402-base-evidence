@@ -99,7 +99,7 @@ finality. The observation layer here records **sealed L2 block inclusion only**,
 receipt's reported block placement, the transaction object's reported block placement and sealed
 block data queried by explicit block number all agree — including that the sealed block's own
 transaction list contains the transaction: for Base's documented public HTTP JSON-RPC the caller's
-block tag selects the confirmation semantics, so the canonical observation never uses the `pending`
+block tag selects the confirmation semantics, so the recorded observation never uses the `pending`
 tag, and sealed inclusion is never inferred from the mere existence of a transaction receipt. `receipt_status` is
 the EVM execution result and nothing else — not an inclusion level, not finality, and not by itself
 evidence that the expected payment occurred; matching-payment evidence additionally requires the
@@ -209,8 +209,9 @@ Configuration is explicit; the live path has no fallbacks:
 | `PEAC_EXAMPLE_RPC_URL` | Optional. Defaults to the documented public endpoint `https://sepolia.base.org`, which is a rate-limited demonstration endpoint; operators with their own endpoint should set this. Only the ORIGIN of the URL is ever printed or recorded. |
 | `PEAC_EXAMPLE_FACILITATOR_URL` | Optional. Defaults to `https://x402.org/facilitator` for Base Sepolia testing. Constructed explicitly, never inferred. |
 
-The payer needs Base Sepolia test USDC only (no ETH: under EIP-3009 the facilitator broadcasts
-and pays gas). Fund the printed payer address from a public testnet faucet.
+In this x402 facilitator flow, the facilitator submits the authorized transaction and pays gas.
+The payer therefore needs only Base Sepolia test USDC — exactly the intended spend, which the
+preflight prints — funded to the printed payer address from a public testnet faucet.
 
 `pnpm demo:live` re-runs the same preflight, refuses to proceed unless every check passes, and
 then performs ONE paid request: real EIP-3009 authorization, facilitator verification and
@@ -218,7 +219,7 @@ settlement, origin result, and a bounded sealed-L2 observation of the settlement
 through the configured RPC endpoint (fixed ~2s cadence within a fixed total deadline; only
 transient states are retried; `pending` is never used; no L1 or confirmation-count claims). The
 evidence directory is written transactionally under `out/`, verified offline before it is
-finalized, and a tamper demonstration proves that one altered byte in a copy fails verification.
+finalized, and a tamper demonstration shows that one altered byte in a copy fails verification.
 The strongest claim a passing run makes: the named Base RPC source reported the transaction in a
 sealed L2 block, and the admitted receipt contained the expected token transfer.
 
@@ -462,7 +463,14 @@ specifications and packages.
   `PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE` and `PAYMENT-RESPONSE`. This example does not define its
   own transport encoding.
 - `payment-identifier` is an x402 **extension** carried inside `PaymentPayload.extensions`, not a
-  fourth HTTP field. It is extracted and validated with the upstream extension APIs.
+  fourth HTTP field. It is extracted and validated with the upstream extension APIs, and the
+  reference origin implements the extension's documented resource-server semantics run-locally:
+  the identifier is bound to a normalized request fingerprint on first use; a retry with the same
+  identifier and the same request after a successful settlement is served the cached result
+  without a second payment; the same identifier naming a different request is refused with 409;
+  and, because the declaration marks the identifier required, a payment payload without a valid
+  one is refused with 400 before verification. The cache lives for one run of the resource and
+  never manufactures a settlement that did not happen.
 - Size bounds are application-local choices made by this example. They are not derived from, and
   imply nothing about, any HTTP parser limit.
 

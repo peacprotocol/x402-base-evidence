@@ -46,6 +46,9 @@ function installedVersion(pkg: string): string {
  */
 const REQUIRED_EXPORTS: Record<string, readonly string[]> = {
   '@x402/core': ['x402Version'],
+  // The client-side seams the live flow relies on: extension enrichment and the
+  // before-payment-creation hook. The instance-method shape is asserted separately below.
+  '@x402/core/client': ['x402Client', 'x402HTTPClient'],
   '@x402/core/http': [
     'decodePaymentRequiredHeader',
     'decodePaymentSignatureHeader',
@@ -106,6 +109,22 @@ for (const sub of REQUIRED_SUBPATHS) {
   const missing = REQUIRED_EXPORTS[sub]!.filter((sym) => !(sym in mod));
   check(`${sub} exports ${REQUIRED_EXPORTS[sub]!.join(', ')}`, missing.length === 0,
     missing.length ? `missing: ${missing.join(', ')}` : '');
+}
+
+// 2b. the client seams the live flow injects through must keep their instance-method shape: the
+//     payment identifier travels through `registerExtension` (enrichment) and the EIP-3009 scope
+//     guard through `onBeforePaymentCreation`. An upstream rename or removal fails here by name,
+//     not somewhere inside a live run.
+{
+  const { x402Client } = await import('@x402/core/client');
+  const proto = x402Client.prototype as unknown as Record<string, unknown>;
+  for (const method of ['registerExtension', 'onBeforePaymentCreation', 'setSpendControls', 'register']) {
+    check(
+      `x402Client.prototype.${method} is a function`,
+      typeof proto[method] === 'function',
+      `got ${typeof proto[method]}`,
+    );
+  }
 }
 
 // 3. the settle-response authority string must be first-party (never shaped like an @x402/core

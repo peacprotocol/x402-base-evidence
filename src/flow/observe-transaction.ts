@@ -249,15 +249,36 @@ export function transferMatchesExpected(
  * an endpoint answer.
  */
 export const ENDPOINT_UNREACHABLE = JSON_RPC_FAILURE_TEXT.unreachable;
+export const ENDPOINT_TEMPORARILY_UNAVAILABLE = JSON_RPC_FAILURE_TEXT.temporarily_unavailable;
 export const ENDPOINT_RPC_ERROR = JSON_RPC_FAILURE_TEXT.rpc_error;
 export const ENDPOINT_RESPONSE_UNUSABLE = JSON_RPC_FAILURE_TEXT.unusable;
 const UNKNOWN_TRANSACTION = 'the endpoint reported no receipt and no transaction for this hash';
 export const MALFORMED_TRANSACTION_REFERENCE =
   'the transaction reference is not a 32-byte transaction hash, so no endpoint was queried';
+/**
+ * A failure this code raised locally, outside the classified JSON-RPC vocabulary. Terminal: a
+ * local error is deterministic from the loop's point of view, and retrying it would rerun the
+ * same defect while attributing the delay to the endpoint.
+ */
+export const OBSERVATION_LOCAL_FAILURE =
+  'the observation failed locally before a usable endpoint answer';
+
+/**
+ * The unavailable-reasons a bounded observation loop may retry, fail-closed.
+ *
+ * Exactly the retryable JSON-RPC failure kinds: a transport-level failure and the explicitly
+ * admitted temporary HTTP statuses. An RPC error, a structurally unusable response, a malformed
+ * transaction reference and a local failure are terminal, and an unavailable-reason outside this
+ * set is treated as terminal rather than retried on the strength of being unrecognized.
+ */
+export const RETRYABLE_UNAVAILABLE_REASONS: ReadonlySet<string> = new Set([
+  ENDPOINT_UNREACHABLE,
+  ENDPOINT_TEMPORARILY_UNAVAILABLE,
+]);
 
 /** The bounded reason for one caught observation failure. Never text a remote party supplied. */
 function reasonFor(e: unknown): string {
-  return e instanceof JsonRpcFailure ? JSON_RPC_FAILURE_TEXT[e.kind] : ENDPOINT_UNREACHABLE;
+  return e instanceof JsonRpcFailure ? JSON_RPC_FAILURE_TEXT[e.kind] : OBSERVATION_LOCAL_FAILURE;
 }
 
 function isoOf(observedAtUnixSeconds: number): string {
@@ -482,9 +503,21 @@ export const MAX_RECEIPT_LOGS = 256;
  * skipped or truncated, because an incomplete log list cannot support any claim about which
  * events the transaction did or did not emit.
  *
+ * LOG PLACEMENT FIELDS ARE CHECKED WHEN PRESENT, NEVER REQUIRED. The live Base Sepolia endpoint
+ * (measured 2026-08-27) reports `removed`, `transactionHash`, `blockHash` and `blockNumber` on
+ * every receipt log; the EIP-1474 log object marks them optional, so their absence is admitted.
+ * When present each must be well-formed and must agree with the receipt this claim rests on: a
+ * log carrying `removed: true` can never satisfy the expected transfer — a removed log inside a
+ * receipt queried for a sealed claim is an inconsistent response, and the receipt is refused
+ * whole rather than read around — and a log whose placement names a different transaction or
+ * block than the receipt's own is the same inconsistency.
+ *
+ * @param result - The raw `eth_getTransactionReceipt` result.
+ * @param expectedTransactionHash - When supplied, a log's `transactionHash` (if present) must
+ *   name this transaction; the receipt is refused whole otherwise.
  * @throws JsonRpcFailure `unusable` when the result is not an admissible receipt.
  */
-export function admitReceiptResult(result: unknown): ObservedReceipt {
+export function admitReceiptResult(result: unknown, expectedTransactionHash?: string): ObservedReceipt {
   if (typeof result !== 'object' || result === null || Array.isArray(result)) {
     throw new JsonRpcFailure('unusable');
   }
@@ -516,7 +549,15 @@ export function admitReceiptResult(result: unknown): ObservedReceipt {
     if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
       throw new JsonRpcFailure('unusable');
     }
-    const log = raw as { address?: unknown; topics?: unknown; data?: unknown };
+    const log = raw as {
+      address?: unknown;
+      topics?: unknown;
+      data?: unknown;
+      removed?: unknown;
+      transactionHash?: unknown;
+      blockHash?: unknown;
+      blockNumber?: unknown;
+    };
     if (typeof log.address !== 'string' || !ADDRESS20.test(log.address)) {
       throw new JsonRpcFailure('unusable');
     }
@@ -525,6 +566,39 @@ export function admitReceiptResult(result: unknown): ObservedReceipt {
     }
     if (typeof log.data !== 'string' || !RPC_DATA.test(log.data)) {
       throw new JsonRpcFailure('unusable');
+    }
+    // Placement fields: optional per EIP-1474, checked when the endpoint reports them. A log
+    // marked removed, or placed in a different transaction or block than the receipt it arrived
+    // in, makes the whole response inconsistent for the claim it exists to support.
+    if (log.removed !== undefined) {
+      if (typeof log.removed !== 'boolean') throw new JsonRpcFailure('unusable');
+      if (log.removed) throw new JsonRpcFailure('unusable');
+    }
+    if (log.transactionHash !== undefined) {
+      if (typeof log.transactionHash !== 'string' || !HASH32.test(log.transactionHash)) {
+        throw new JsonRpcFailure('unusable');
+      }
+      if (
+        expectedTransactionHash !== undefined &&
+        log.transactionHash.toLowerCase() !== expectedTransactionHash.toLowerCase()
+      ) {
+        throw new JsonRpcFailure('unusable');
+      }
+    }
+    if (log.blockHash !== undefined) {
+      if (typeof log.blockHash !== 'string' || !HASH32.test(log.blockHash)) {
+        throw new JsonRpcFailure('unusable');
+      }
+      if (blockHash !== null && log.blockHash.toLowerCase() !== blockHash.toLowerCase()) {
+        throw new JsonRpcFailure('unusable');
+      }
+    }
+    if (log.blockNumber !== undefined && log.blockNumber !== null) {
+      const logBlockNumber = admitRpcQuantity(log.blockNumber);
+      if (logBlockNumber === undefined) throw new JsonRpcFailure('unusable');
+      if (blockNumber !== null && logBlockNumber !== blockNumber) {
+        throw new JsonRpcFailure('unusable');
+      }
     }
     logs.push({ address: log.address, topics: log.topics as string[], data: log.data });
   }
@@ -614,7 +688,7 @@ export function baseSealedRpcSource(rpcUrl: string, timeoutMs = 10_000): SealedT
       if (!HASH32.test(transactionHash)) throw new JsonRpcFailure('unusable');
       const result = await jsonRpcRequest(rpcUrl, 'eth_getTransactionReceipt', [transactionHash], timeoutMs);
       if (result === null) return undefined;
-      return admitReceiptResult(result);
+      return admitReceiptResult(result, transactionHash);
     },
     async transactionByHash(transactionHash: string): Promise<ObservedTransaction | undefined> {
       if (!HASH32.test(transactionHash)) throw new JsonRpcFailure('unusable');

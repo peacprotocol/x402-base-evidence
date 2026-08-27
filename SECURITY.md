@@ -90,7 +90,7 @@ truth, issuer authority, client receipt or finality.
 
 Base distinguishes Flashblock preconfirmation, sealed L2 block inclusion, L1 batch inclusion and L1
 finality. The observation layer in this repository records sealed L2 block inclusion only, with the
-named source and the observation level actually established: the canonical observation never uses
+named source and the observation level actually established: the recorded observation never uses
 the `pending` block tag, sealed inclusion is recorded only after the receipt's reported placement,
 the transaction object's reported placement and sealed block data queried by explicit block number
 all agree — including that the sealed block's own transaction list contains the transaction — and
