@@ -86,6 +86,22 @@ interface StoredIssuerKey {
 /** Exactly the 32 bytes of an Ed25519 private key, written as lower or upper case hex. */
 const PRIVATE_KEY_HEX = /^[0-9a-fA-F]{64}$/;
 
+/**
+ * The largest key identifier record issuance accepts, in UTF-8 bytes.
+ *
+ * The installed record-issuing library bounds `kid` at 256 UTF-8 bytes and refuses anything
+ * larger at issuance time. Its packages do not export that bound as a root-level constant, so
+ * it is restated here as the narrowest local value and pinned to the installed library's actual
+ * behavior by the issuance-parity tests, which issue at and beyond this boundary with a
+ * throwaway in-memory key. If a future protocol version moves the bound, the parity tests fail
+ * loudly and this constant is corrected with them.
+ *
+ * The bound is the ONLY admission added for a stored key identifier. Issuance accepts short
+ * identifiers and identifiers containing spaces, so this file does too: stored-key admission
+ * must be no weaker than issuance, and no stronger either.
+ */
+export const MAX_STORED_KID_UTF8_BYTES = 256;
+
 /** A configured issuer this example will not sign under. Never raised about a key file. */
 export class IssuerConfigurationError extends Error {
   constructor(reason: string) {
@@ -219,6 +235,16 @@ function loadStoredKey(path: string): StoredIssuerKey | undefined {
   const stored = parsed as Partial<StoredIssuerKey>;
   if (typeof stored.kid !== 'string' || stored.kid.length === 0) {
     refuseKeyFile(path, 'it has no key identifier');
+  }
+  // A deterministic value read from persistent local state that the issuing library can reject
+  // must be validated before a payment-capable phase. A stored identifier past the issuance
+  // bound would otherwise pass preflight and surface only at evidence issuance, after payment.
+  if (Buffer.byteLength(stored.kid, 'utf8') > MAX_STORED_KID_UTF8_BYTES) {
+    refuseKeyFile(
+      path,
+      `its key identifier exceeds ${MAX_STORED_KID_UTF8_BYTES} UTF-8 bytes, which record ` +
+        'issuance refuses; move the key file aside so a new key is created',
+    );
   }
   // Validated as hex before decoding, because the decoder discards characters it does not
   // recognise: a damaged field would otherwise decode to a shorter, entirely different key.

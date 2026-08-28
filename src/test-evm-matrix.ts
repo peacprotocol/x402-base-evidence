@@ -78,7 +78,9 @@ import {
   assertCanonicalLiveHttpsIssuer,
   FIXTURE_ISSUER,
   IssuerConfigurationError,
+  MAX_STORED_KID_UTF8_BYTES,
   resolveIssuerKey,
+  storedIssuerBinding,
 } from './flow/issuer-key.ts';
 import { InvalidKeyFileError } from './flow/key-file.ts';
 import { loadPayerAccount } from './flow/payer-key.ts';
@@ -2663,6 +2665,181 @@ recordExecution('X402-REJECT-011');
     !slashIssuance.issued && slashIssuance.message.includes('canonical'),
     slashIssuance.message,
   );
+}
+
+// Stored key identifier bound: every deterministic value read from persistent local state that
+// the issuing library can reject is validated before a payment-capable phase. The stored `kid`
+// is signed into the record header, and issuance bounds it at MAX_STORED_KID_UTF8_BYTES UTF-8
+// bytes; a stored identifier past that bound must be refused when the key file is read — at
+// preflight, before payment — never discovered at evidence issuance after funds have moved.
+// The boundary is pinned to the installed library first, with a throwaway in-memory key, so
+// the local constant cannot drift from what issuance actually does. The bound is the ONLY
+// admission: short identifiers and identifiers with spaces issue upstream and stay admitted.
+{
+  const throwaway = await generateKeypair();
+  const kidIssues = async (kid: string): Promise<{ issued: boolean; message: string }> => {
+    try {
+      const result = await issue({
+        iss: 'https://issuer.example',
+        kind: 'evidence',
+        type: RECORD_TYPE,
+        privateKey: throwaway.privateKey,
+        kid,
+        pillars: ['commerce'],
+        occurred_at: '2026-08-28T00:00:00Z',
+        extensions: {
+          [COMMERCE_GROUP]: {
+            payment_rail: 'x402',
+            amount_minor: F.AMOUNT_BASE_UNITS,
+            currency: 'USDC',
+            asset: F.ASSET_CONTRACT,
+            env: 'test',
+          },
+          [PAYMENT_EVIDENCE_GROUP]: { note: 'kid boundary vector' },
+        },
+      });
+      return { issued: result.jws.length > 0, message: '' };
+    } catch (e) {
+      return { issued: false, message: String(e instanceof Error ? e.message : e).split('\n')[0] ?? '' };
+    }
+  };
+
+  // The boundary itself, confirmed against the installed library. The multibyte vectors use a
+  // two-UTF-8-byte character, so character count and byte count disagree — exactly the case a
+  // character-based bound would get wrong.
+  const ascii256 = 'k'.repeat(MAX_STORED_KID_UTF8_BYTES);
+  const ascii257 = 'k'.repeat(MAX_STORED_KID_UTF8_BYTES + 1);
+  const multibyte256 = 'é'.repeat(MAX_STORED_KID_UTF8_BYTES / 2);
+  const multibyte258 = 'é'.repeat(MAX_STORED_KID_UTF8_BYTES / 2 + 1);
+  const ascii256Issuance = await kidIssues(ascii256);
+  check(
+    'kid parity: an identifier of exactly 256 ASCII bytes is issuable by the installed library',
+    ascii256Issuance.issued,
+    ascii256Issuance.message,
+  );
+  check(
+    'kid parity: an identifier of 257 ASCII bytes is refused by the installed library',
+    !(await kidIssues(ascii257)).issued,
+  );
+  const multibyte256Issuance = await kidIssues(multibyte256);
+  check(
+    'kid parity: an identifier of exactly 256 UTF-8 bytes via multibyte characters is issuable',
+    Buffer.byteLength(multibyte256, 'utf8') === MAX_STORED_KID_UTF8_BYTES && multibyte256Issuance.issued,
+    multibyte256Issuance.message,
+  );
+  check(
+    'kid parity: a multibyte identifier past 256 UTF-8 bytes is refused by the installed library',
+    !(await kidIssues(multibyte258)).issued,
+  );
+
+  // Stored-key admission agrees with that boundary in both directions, and a refusal is
+  // observation-only: the key file on disk stays byte-identical.
+  const scratch = mkdtempSync(join(tmpdir(), 'peac-stored-kid-'));
+  temporaryDirectories.push(scratch);
+  const storedKeyFile = (name: string, kid: string): { path: string; bytes: string } => {
+    const path = join(scratch, name);
+    const bytes = `${JSON.stringify(
+      { note: 'test vector', kid, issuer: 'https://issuer.example.test', privateKeyHex: '11'.repeat(32) },
+      null,
+      2,
+    )}\n`;
+    writeFileSync(path, bytes);
+    return { path, bytes };
+  };
+  const loads = (path: string): { loaded: boolean; message: string } => {
+    try {
+      return { loaded: storedIssuerBinding(path) === 'https://issuer.example.test', message: '' };
+    } catch (e) {
+      return { loaded: false, message: e instanceof InvalidKeyFileError ? e.message : `unexpected ${String(e)}` };
+    }
+  };
+
+  const storedAscii256 = storedKeyFile('kid-ascii-256.json', ascii256);
+  check('a stored key identifier of exactly 256 ASCII bytes is admitted', loads(storedAscii256.path).loaded);
+  const storedAscii257 = storedKeyFile('kid-ascii-257.json', ascii257);
+  const ascii257Refusal = loads(storedAscii257.path);
+  check(
+    'a stored key identifier of 257 ASCII bytes is refused before it can reach issuance',
+    !ascii257Refusal.loaded && ascii257Refusal.message.includes('UTF-8 bytes'),
+    ascii257Refusal.message,
+  );
+  check(
+    'the stored admission matches the installed library on the exact multibyte boundary',
+    loads(storedKeyFile('kid-multibyte-256.json', multibyte256).path).loaded === multibyte256Issuance.issued,
+  );
+  const storedMultibyte258 = storedKeyFile('kid-multibyte-258.json', multibyte258);
+  const multibyteRefusal = loads(storedMultibyte258.path);
+  check(
+    'a stored multibyte identifier past 256 UTF-8 bytes is refused',
+    !multibyteRefusal.loaded && multibyteRefusal.message.includes('UTF-8 bytes'),
+    multibyteRefusal.message,
+  );
+  check(
+    'the refusals modified nothing: both refused key files are byte-identical on disk',
+    readFileSync(storedAscii257.path, 'utf8') === storedAscii257.bytes &&
+      readFileSync(storedMultibyte258.path, 'utf8') === storedMultibyte258.bytes,
+  );
+
+  // The full preflight a live run must pass: with everything else in order, an oversized stored
+  // identifier alone leaves the run NOT ready, the binding check names the refusal, and nothing
+  // asked the facilitator to verify or settle anything.
+  const payerKeyPath = join(scratch, 'payer.json');
+  writeFileSync(
+    payerKeyPath,
+    `${JSON.stringify({ note: 'test vector', privateKeyHex: `0x${'22'.repeat(32)}` }, null, 2)}\n`,
+  );
+  const facilitator = createFixtureFacilitator(F.NETWORK);
+  const report = await runPreflight({
+    network: F.NETWORK,
+    payTo: F.PAY_TO,
+    asset: F.ASSET_CONTRACT,
+    rpc: {
+      chainId: async (): Promise<bigint> => BASE_SEPOLIA_CHAIN_ID,
+      erc20Balance: async (): Promise<bigint> => MIN_USDC_BASE_UNITS,
+    },
+    facilitatorClient: facilitator.client,
+    payerKeyMode: 'require-existing',
+    payerKeyPath,
+    outDirectory: join(scratch, 'out'),
+    issuer: { configured: 'https://issuer.example.test', keyPath: storedAscii257.path },
+  });
+  check(
+    'a full preflight with an oversized stored key identifier is not ready, the binding check is the failure, and no payment was verified or settled',
+    !report.ready &&
+      report.checks.some(
+        (c) =>
+          c.name === 'existing issuer key records the configured issuer' &&
+          c.status === 'failed' &&
+          c.detail.includes('UTF-8 bytes'),
+      ) &&
+      report.checks.every(
+        (c) => c.name === 'existing issuer key records the configured issuer' || c.status !== 'failed',
+      ) &&
+      facilitator.calls.verify === 0 &&
+      facilitator.calls.settle === 0,
+    JSON.stringify(report.checks),
+  );
+  check(
+    'the preflight refusal modified nothing: the oversized key file is byte-identical on disk',
+    readFileSync(storedAscii257.path, 'utf8') === storedAscii257.bytes,
+  );
+
+  // A key generated by the live path itself stays admissible: the identifier it writes is
+  // within the issuance bound, and the file it wrote loads straight back.
+  const liveKeyPath = join(scratch, 'generated-issuer.json');
+  const savedIssuer = process.env['PEAC_EXAMPLE_ISSUER'];
+  process.env['PEAC_EXAMPLE_ISSUER'] = 'https://issuer.example.test';
+  try {
+    const generated = await resolveIssuerKey('live', liveKeyPath);
+    check(
+      'a normally generated live key identifier is within the issuance bound and loads back admitted',
+      Buffer.byteLength(generated.kid, 'utf8') <= MAX_STORED_KID_UTF8_BYTES &&
+        storedIssuerBinding(liveKeyPath) === 'https://issuer.example.test',
+    );
+  } finally {
+    if (savedIssuer === undefined) delete process.env['PEAC_EXAMPLE_ISSUER'];
+    else process.env['PEAC_EXAMPLE_ISSUER'] = savedIssuer;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
