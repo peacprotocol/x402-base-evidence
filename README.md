@@ -122,7 +122,7 @@ disagreement, not resolved into either side being authoritative.
 | end-to-end payment flow | implemented; exercised offline against an in-process facilitator |
 | PEAC signed record issuance and offline verification | implemented |
 | settlement observation layer (sealed-L2 contract) | implemented; exercised against synthetic sealed sources |
-| live Base Sepolia execution and live settlement observation | runner and preflight implemented ([§5.1](#51-live-run-base-sepolia)); no live execution has been performed or recorded yet |
+| live Base Sepolia execution and live settlement observation | runner and preflight implemented ([§5.1](#51-live-run-base-sepolia)); no successful live acceptance artifact is published in this revision |
 | x402 signed offers and receipts | preserved when present inside captured field values; not enabled in the deterministic fixture (see [§9](#9-relationship-to-peac-x402-and-base)) |
 | scheme `upto` | out of scope |
 | batch settlement | out of scope |
@@ -205,7 +205,7 @@ Configuration is explicit; the live path has no fallbacks:
 | Variable | Meaning |
 |---|---|
 | `PEAC_EXAMPLE_PAY_TO` | REQUIRED. A Base Sepolia address the operator controls, receiving the payment. There is no default and no fallback to the synthetic fixture recipient. This example does NOT prove control of the address; supplying an address the operator controls is the operator's responsibility. |
-| `PEAC_EXAMPLE_ISSUER` | REQUIRED. Absolute `http`/`https` URL naming the party issuing the records. There is no default issuer; an existing issuer key bound to a different issuer stops the run with the key untouched. |
+| `PEAC_EXAMPLE_ISSUER` | REQUIRED. The canonical `https` origin of the party issuing the records — scheme and host only, exactly as record issuance admits it (`https://issuer.example`, never `https://issuer.example/`). A non-canonical value (trailing slash, path, query, fragment, credentials, or a non-`https` scheme) fails the preflight before any payment can begin, and the refusal names the canonical form. There is no default issuer; an existing issuer key bound to a different issuer stops the run with the key untouched. |
 | `PEAC_EXAMPLE_RPC_URL` | Optional. Defaults to the documented public endpoint `https://sepolia.base.org`, which is a rate-limited demonstration endpoint; operators with their own endpoint should set this. Only the ORIGIN of the URL is ever printed or recorded. |
 | `PEAC_EXAMPLE_FACILITATOR_URL` | Optional. Defaults to `https://x402.org/facilitator` for Base Sepolia testing. Constructed explicitly, never inferred. |
 

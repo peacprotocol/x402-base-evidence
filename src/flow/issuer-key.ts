@@ -91,8 +91,9 @@ export class IssuerConfigurationError extends Error {
   constructor(reason: string) {
     super(
       `The configured issuer cannot be used: ${reason}\n` +
-        `  Set ${LIVE_ISSUER_ENV} to an absolute http or https URL naming the party that issues ` +
-        'these records. A live run has no default issuer.',
+        `  Set ${LIVE_ISSUER_ENV} to the canonical https origin of the party that issues these ` +
+        'records: scheme and host only, with no path, query, fragment, credentials or trailing ' +
+        'slash. A live run has no default issuer.',
     );
     this.name = 'IssuerConfigurationError';
   }
@@ -121,20 +122,34 @@ export class IssuerBindingError extends Error {
 }
 
 /**
- * Check that a value can be used as the issuer a record claims.
+ * Check that a value can be used as the issuer a live record claims.
  *
- * An issuer identifies a party, so it has to be something a reader could resolve: an absolute http
- * or https URL. Credentials and fragments are refused rather than stripped, because this value is
- * signed into a document meant to be handed to someone else, and quietly publishing a trimmed
- * version of what was configured is worse than refusing it.
+ * The rule is the issuance contract's rule. The installed record-issuing library admits an `iss`
+ * only in canonical form: for a URL issuer, exactly an https origin — scheme and host (with an
+ * explicit non-default port kept), and nothing else. Live issuer admission must be no weaker than
+ * record issuance: a deterministic issuer configuration the issuing library will refuse must be
+ * refused before the reference can reach a payment-capable phase, so the admission here is
+ * exactly the canonical-origin rule: `new URL(value).origin === value`.
  *
- * The value is returned exactly as supplied. Nothing is normalized: a trailing slash added here
- * would mean the record claims an issuer nobody configured.
+ * Credentials are refused with their own message rather than folded into the origin comparison,
+ * because this value is signed into a document meant to be handed to someone else, and because a
+ * refused credential-bearing value must never be echoed back.
+ *
+ * The value is returned exactly as supplied. Nothing is normalized: a trailing slash stripped
+ * here would mean the record claims an issuer nobody configured. The refusal names the canonical
+ * form instead, and the operator decides.
+ *
+ * DID issuers, which the issuance contract also admits, are out of scope for this example: it
+ * demonstrates a resolvable https identity, and admitting a form it never exercises would be
+ * untested surface.
+ *
+ * The name states the narrowed application-local contract: this admits only a canonical https
+ * origin for LIVE use, deliberately narrower than everything the protocol itself can issue with.
  *
  * @param value - The configured issuer, exactly as it arrived.
- * @throws IssuerConfigurationError when it is not usable as an issuer identity.
+ * @throws IssuerConfigurationError when it is not usable as a live issuer identity.
  */
-export function assertUsableIssuer(value: string): string {
+export function assertCanonicalLiveHttpsIssuer(value: string): string {
   if (value.length === 0) throw new IssuerConfigurationError('it is empty');
   if (value.length > 256) throw new IssuerConfigurationError('it is longer than 256 characters');
   if (value.trim() !== value) throw new IssuerConfigurationError('it has leading or trailing whitespace');
@@ -144,13 +159,18 @@ export function assertUsableIssuer(value: string): string {
   } catch {
     throw new IssuerConfigurationError('it is not an absolute URL');
   }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new IssuerConfigurationError('it is not an http or https URL');
+  if (url.protocol !== 'https:') {
+    throw new IssuerConfigurationError('it is not an https URL, and records name issuers by https origin');
   }
   if (url.username.length > 0 || url.password.length > 0) {
     throw new IssuerConfigurationError('it carries credentials, which would be signed into records');
   }
-  if (url.hash.length > 0) throw new IssuerConfigurationError('it carries a fragment');
+  if (url.origin !== value) {
+    throw new IssuerConfigurationError(
+      `it is not a canonical https origin: record issuance accepts exactly ${url.origin} ` +
+        '(scheme and host only — no path, query, fragment or trailing slash)',
+    );
+  }
   return value;
 }
 
@@ -166,7 +186,7 @@ function configuredLiveIssuer(): string {
   if (configured === undefined) {
     throw new IssuerConfigurationError(`${LIVE_ISSUER_ENV} is not set, and live mode has no default issuer`);
   }
-  return assertUsableIssuer(configured);
+  return assertCanonicalLiveHttpsIssuer(configured);
 }
 
 /**

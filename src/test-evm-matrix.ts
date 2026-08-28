@@ -39,6 +39,8 @@ import { registerExactEvmScheme } from '@x402/evm/exact/server';
 import { ExactEvmScheme as UpstreamExactEvmFacilitator } from '@x402/evm/exact/facilitator';
 import { authorizationTypes, type FacilitatorEvmSigner } from '@x402/evm';
 import { privateKeyToAccount } from 'viem/accounts';
+import { generateKeypair } from '@peac/crypto';
+import { issue } from '@peac/protocol';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
 import {
   PAYMENT_IDENTIFIER,
@@ -65,8 +67,16 @@ import {
   RESOURCE_QUERY,
   runOnce,
 } from './flow/fixture-e2e.ts';
-import { writeEvidence, type EvidenceLayout } from './flow/issue-record.ts';
 import {
+  COMMERCE_GROUP,
+  PAYMENT_EVIDENCE_GROUP,
+  RECORD_TYPE,
+  writeEvidence,
+  type EvidenceLayout,
+} from './flow/issue-record.ts';
+import {
+  assertCanonicalLiveHttpsIssuer,
+  FIXTURE_ISSUER,
   IssuerConfigurationError,
   resolveIssuerKey,
 } from './flow/issuer-key.ts';
@@ -110,6 +120,7 @@ import {
 } from './flow/live-e2e.ts';
 import {
   admitEndpointUrl,
+  BASE_SEPOLIA_CHAIN_ID,
   checkChainState,
   checkIssuerReadiness,
   checkLocalConfiguration,
@@ -119,6 +130,7 @@ import {
   jsonRpcChainState,
   MIN_USDC_BASE_UNITS,
   reviewerMaterialWritableCheck,
+  runPreflight,
 } from './flow/preflight.ts';
 import {
   verifyEvidence,
@@ -2428,6 +2440,228 @@ recordExecution('X402-REJECT-011');
     'live issuer resolution with no configured issuer fails closed and creates no key file',
     refusal instanceof IssuerConfigurationError && !existsSync(freshKeyPath),
     String(refusal),
+  );
+}
+
+// Live issuer admission is the record-issuance contract's canonical-origin rule, applied before
+// anything can be signed or spent. Live issuer admission must be no weaker than record issuance:
+// a deterministic issuer configuration the issuing library will refuse must be refused before
+// the reference can reach a payment-capable phase, never discovered at evidence issuance. The
+// preflight and the run resolve the issuer through the same function,
+// `assertCanonicalLiveHttpsIssuer`, so the two cannot drift apart; these vectors pin the rule,
+// and the issuance-parity block below pins the rule to the installed issuing library itself.
+{
+  const CANONICAL = 'https://issuer.example';
+  const admission = (value: string): { admitted: boolean; message: string } => {
+    try {
+      return { admitted: assertCanonicalLiveHttpsIssuer(value) === value, message: '' };
+    } catch (e) {
+      return {
+        admitted: false,
+        message: e instanceof IssuerConfigurationError ? e.message : `unexpected ${String(e)}`,
+      };
+    }
+  };
+
+  check('the canonical https origin is admitted, byte for byte', admission(CANONICAL).admitted);
+  check(
+    'an explicit non-default port stays part of the canonical origin and is admitted',
+    admission('https://payments.example:8443').admitted,
+  );
+
+  const slash = admission(`${CANONICAL}/`);
+  check(
+    'a trailing-slash issuer is rejected, never normalized, and the refusal names the exact canonical value',
+    !slash.admitted && slash.message.includes(`accepts exactly ${CANONICAL} (`),
+    slash.message,
+  );
+  check('a path-bearing issuer is rejected', !admission(`${CANONICAL}/records`).admitted);
+  check('a query-bearing issuer is rejected', !admission(`${CANONICAL}/?tenant=a`).admitted);
+  check('a fragment-bearing issuer is rejected', !admission(`${CANONICAL}#keys`).admitted);
+  const credentialed = admission('https://operator:secret-credential@issuer.example');
+  check(
+    'a credential-bearing issuer is rejected and the refusal never echoes the credential',
+    !credentialed.admitted && !credentialed.message.includes('secret-credential'),
+    credentialed.message,
+  );
+  check('a non-https issuer is rejected', !admission('http://issuer.example').admitted);
+  check('a malformed issuer is rejected', !admission('not a url').admitted);
+
+  // The preflight reports the same refusal, with the canonical value in the operator-facing
+  // detail, because the preflight resolves the issuer through the same admission function.
+  const scratch = mkdtempSync(join(tmpdir(), 'peac-issuer-canonical-'));
+  temporaryDirectories.push(scratch);
+  const preflightChecks = checkIssuerReadiness(`${CANONICAL}/`, join(scratch, 'issuer.json'));
+  check(
+    'the preflight fails a trailing-slash issuer and its detail names the canonical value',
+    preflightChecks[0]?.status === 'failed' &&
+      preflightChecks[0].detail.includes(`accepts exactly ${CANONICAL} (`),
+    JSON.stringify(preflightChecks),
+  );
+
+  // Failing closed means failing with NO side effects: resolution of a non-canonical issuer
+  // creates no key file, and an existing key file is not opened, not compared and not modified —
+  // the configured value is refused before stored key material is considered at all.
+  const savedIssuer = process.env['PEAC_EXAMPLE_ISSUER'];
+  process.env['PEAC_EXAMPLE_ISSUER'] = `${CANONICAL}/`;
+  const neverCreatedPath = join(scratch, 'never-created.json');
+  let slashRefusal: unknown;
+  try {
+    await resolveIssuerKey('live', neverCreatedPath);
+  } catch (e) {
+    slashRefusal = e;
+  }
+  check(
+    'live resolution of a trailing-slash issuer fails closed and creates no key file',
+    slashRefusal instanceof IssuerConfigurationError && !existsSync(neverCreatedPath),
+    String(slashRefusal),
+  );
+
+  const existingKeyPath = join(scratch, 'existing-issuer.json');
+  const existingKeyBytes = `${JSON.stringify(
+    {
+      note: 'test vector',
+      kid: 'canonical-vector-key-1',
+      issuer: CANONICAL,
+      privateKeyHex: '11'.repeat(32),
+    },
+    null,
+    2,
+  )}\n`;
+  writeFileSync(existingKeyPath, existingKeyBytes);
+  let existingKeyRefusal: unknown;
+  try {
+    await resolveIssuerKey('live', existingKeyPath);
+  } catch (e) {
+    existingKeyRefusal = e;
+  }
+  check(
+    'live resolution of a trailing-slash issuer refuses the configuration itself and leaves an existing key file byte-identical',
+    existingKeyRefusal instanceof IssuerConfigurationError &&
+      readFileSync(existingKeyPath, 'utf8') === existingKeyBytes,
+    String(existingKeyRefusal),
+  );
+  if (savedIssuer === undefined) delete process.env['PEAC_EXAMPLE_ISSUER'];
+  else process.env['PEAC_EXAMPLE_ISSUER'] = savedIssuer;
+
+  // The full preflight a live run must pass: with everything else in order — a loadable payer
+  // key vector, a distinct recipient, the upstream asset, a chain endpoint answering correctly
+  // and a facilitator advertising the scheme — a trailing-slash issuer alone leaves the run NOT
+  // ready, and nothing asked the facilitator to verify or settle anything. The same
+  // configuration with the canonical issuer is ready, so the refusal is attributable to the
+  // issuer value and to nothing else.
+  const payerKeyPath = join(scratch, 'payer.json');
+  const payerPrivateKeyHex = `0x${'22'.repeat(32)}` as const;
+  writeFileSync(
+    payerKeyPath,
+    `${JSON.stringify({ note: 'test vector', privateKeyHex: payerPrivateKeyHex }, null, 2)}\n`,
+  );
+  check(
+    'the payer vector and the fixture recipient are distinct accounts',
+    privateKeyToAccount(payerPrivateKeyHex).address.toLowerCase() !== F.PAY_TO.toLowerCase(),
+  );
+  const stubChainState = {
+    chainId: async (): Promise<bigint> => BASE_SEPOLIA_CHAIN_ID,
+    erc20Balance: async (): Promise<bigint> => MIN_USDC_BASE_UNITS,
+  };
+  const preflightFor = async (issuerValue: string) => {
+    const facilitator = createFixtureFacilitator(F.NETWORK);
+    const report = await runPreflight({
+      network: F.NETWORK,
+      payTo: F.PAY_TO,
+      asset: F.ASSET_CONTRACT,
+      rpc: stubChainState,
+      facilitatorClient: facilitator.client,
+      payerKeyMode: 'require-existing',
+      payerKeyPath,
+      outDirectory: join(scratch, 'out'),
+      issuer: { configured: issuerValue, keyPath: join(scratch, 'preflight-issuer.json') },
+    });
+    return { report, calls: facilitator.calls };
+  };
+  const notReady = await preflightFor(`${CANONICAL}/`);
+  check(
+    'a full preflight with a trailing-slash issuer is not ready, the issuer check is the failure, and no payment was verified or settled',
+    !notReady.report.ready &&
+      notReady.report.checks.some(
+        (c) => c.name === 'issuer is explicitly configured for live mode' && c.status === 'failed',
+      ) &&
+      notReady.report.checks.every(
+        (c) => c.name === 'issuer is explicitly configured for live mode' || c.status !== 'failed',
+      ) &&
+      notReady.calls.verify === 0 &&
+      notReady.calls.settle === 0,
+    JSON.stringify(notReady.report.checks),
+  );
+  const ready = await preflightFor(CANONICAL);
+  check(
+    'the same preflight with the canonical issuer is ready, so the refusal above is attributable to the issuer alone',
+    ready.report.ready && ready.calls.verify === 0 && ready.calls.settle === 0,
+    JSON.stringify(ready.report.checks),
+  );
+}
+
+// Issuance parity: what this reference admits as a live issuer must be what the installed
+// record-issuing library will actually issue with. The admission rule above is local code, and
+// local code can drift from the library it fronts for; this block closes that gap with the
+// library itself, using a throwaway in-memory key and the same record type, pillar and extension
+// groups the real evidence path uses. If a future protocol version tightens or shifts its
+// canonical-issuer contract, the admitted vectors below stop issuing and this fails loudly in
+// tests, before any live run can reach a payment-capable phase. No file key, no network.
+{
+  const throwaway = await generateKeypair();
+  const issueWith = async (iss: string): Promise<{ issued: boolean; message: string }> => {
+    try {
+      const result = await issue({
+        iss,
+        kind: 'evidence',
+        type: RECORD_TYPE,
+        privateKey: throwaway.privateKey,
+        kid: 'issuance-parity-throwaway-key-1',
+        pillars: ['commerce'],
+        occurred_at: '2026-08-28T00:00:00Z',
+        extensions: {
+          [COMMERCE_GROUP]: {
+            payment_rail: 'x402',
+            amount_minor: F.AMOUNT_BASE_UNITS,
+            currency: 'USDC',
+            asset: F.ASSET_CONTRACT,
+            env: 'test',
+          },
+          [PAYMENT_EVIDENCE_GROUP]: { note: 'issuance parity vector' },
+        },
+      });
+      return { issued: result.jws.length > 0, message: '' };
+    } catch (e) {
+      return { issued: false, message: String(e instanceof Error ? e.message : e).split('\n')[0] ?? '' };
+    }
+  };
+
+  const admittedVectors = [
+    'https://issuer.example',
+    'https://payments.example:8443',
+    FIXTURE_ISSUER,
+  ];
+  for (const iss of admittedVectors) {
+    let admitted = false;
+    try {
+      admitted = assertCanonicalLiveHttpsIssuer(iss) === iss;
+    } catch {
+      admitted = false;
+    }
+    const issuance = await issueWith(iss);
+    check(
+      `issuance parity: an issuer this reference admits is issuable by the installed library (${iss})`,
+      admitted && issuance.issued,
+      issuance.message,
+    );
+  }
+
+  const slashIssuance = await issueWith('https://issuer.example/');
+  check(
+    'issuance parity: a non-canonical trailing-slash issuer is refused by the installed library',
+    !slashIssuance.issued && slashIssuance.message.includes('canonical'),
+    slashIssuance.message,
   );
 }
 

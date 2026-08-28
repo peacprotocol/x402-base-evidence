@@ -42,7 +42,7 @@ import {
   jsonRpcRequest,
 } from './evm-json-rpc.ts';
 import {
-  assertUsableIssuer,
+  assertCanonicalLiveHttpsIssuer,
   ISSUER_KEY_PATH,
   IssuerConfigurationError,
   LIVE_ISSUER_ENV,
@@ -79,7 +79,8 @@ export const FUNDING_INSTRUCTIONS = [
   'ETH is not required: in this x402 facilitator flow, the facilitator submits the authorized',
   'transaction and pays gas, so the payer needs only Base Sepolia test USDC.',
   'Recipient: set PEAC_EXAMPLE_PAY_TO to a Base Sepolia address the operator controls.',
-  'Issuer: set PEAC_EXAMPLE_ISSUER to the absolute http or https URL of the issuing party.',
+  'Issuer: set PEAC_EXAMPLE_ISSUER to the canonical https origin of the issuing party',
+  '(scheme and host only, no path, query, fragment or trailing slash).',
 ].join('\n  ');
 
 /**
@@ -201,7 +202,7 @@ export function checkIssuerReadiness(
   }
   let issuer: string;
   try {
-    issuer = assertUsableIssuer(configuredIssuer);
+    issuer = assertCanonicalLiveHttpsIssuer(configuredIssuer);
   } catch (e) {
     const reason =
       e instanceof IssuerConfigurationError
