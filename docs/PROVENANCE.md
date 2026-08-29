@@ -44,8 +44,9 @@ reimplemented against EVM artifacts and Base observation semantics.
 
 **Not ported / no analog in this repository:** the Solana-specific test files (`test-evidence.ts`,
 `test-keys.ts`, `test-preflight.ts`, `test-verifier-inputs.ts`) and the Solana live-run entry
-point (`devnet-demo.ts`). No successful live Base Sepolia acceptance artifact is published in
-this revision.
+point (`devnet-demo.ts`). One successful live Base Sepolia acceptance run is recorded in
+[`LIVE_BASE_SEPOLIA_ACCEPTANCE.md`](LIVE_BASE_SEPOLIA_ACCEPTANCE.md), with its immutable
+checksums committed under `evidence/base-sepolia/live-20260828T214534z/`.
 
 ## Checksum manifest
 
