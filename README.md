@@ -9,11 +9,13 @@ PEAC record issuance over the resulting digests, and offline verification of tha
 supplied public key, with a deterministic validation corpus and a byte-reproducible offline
 end-to-end fixture.
 
-This revision is validated through the deterministic offline flow. A Base Sepolia live acceptance
-runner (`pnpm demo:live`) and its preflight (`pnpm demo:live:prepare`) are implemented, and NO
-live execution has been performed or recorded yet: no output in this repository may be presented
-as a payment having been made. See
-[§4 Current implementation status](#4-current-implementation-status) and
+This revision is validated through the deterministic offline flow, and ONE Base Sepolia live
+acceptance run has been executed and PASSED (run `live-20260828T214534z`; see
+[`docs/LIVE_BASE_SEPOLIA_ACCEPTANCE.md`](docs/LIVE_BASE_SEPOLIA_ACCEPTANCE.md) for the run facts,
+immutable checksums, and the exact claim boundary). The strongest claim that run supports: the
+named Base RPC source reported the transaction in a sealed L2 block, and the admitted receipt
+contained the expected token transfer. No output of the OFFLINE path may be presented as a payment
+having been made. See [§4 Current implementation status](#4-current-implementation-status) and
 [§5.1 Live run](#51-live-run-base-sepolia).
 
 Independent open-source reference implementation; not an endorsement or official implementation of
@@ -54,10 +56,11 @@ between the two repositories, and none is introduced by this note).
 
 ## 2. What this is not
 
-- **Not a live-proven payment flow.** The flow is complete and exercised offline against an
-  in-process facilitator and wallet stand-in; this revision includes no real Base Sepolia
-  transaction executed from this repository, and no output of the offline path may be presented as
-  a payment having been made.
+- **Not proof beyond one bounded live observation.** The flow is exercised offline against an
+  in-process facilitator and wallet stand-in, and one live Base Sepolia acceptance run has been
+  executed and recorded ([`docs/LIVE_BASE_SEPOLIA_ACCEPTANCE.md`](docs/LIVE_BASE_SEPOLIA_ACCEPTANCE.md)).
+  That run's claim is bounded exactly as documented there; no output of the offline path may be
+  presented as a payment having been made.
 - **Not an x402 conformance authority.** Validation authority is always named per artifact
   ([§6](#6-validation-and-acceptance-model)); nothing here should be read as an x402 standards body
   or as speaking for the x402 project.
@@ -122,7 +125,7 @@ disagreement, not resolved into either side being authoritative.
 | end-to-end payment flow | implemented; exercised offline against an in-process facilitator |
 | PEAC signed record issuance and offline verification | implemented |
 | settlement observation layer (sealed-L2 contract) | implemented; exercised against synthetic sealed sources |
-| live Base Sepolia execution and live settlement observation | runner and preflight implemented ([§5.1](#51-live-run-base-sepolia)); no successful live acceptance artifact is published in this revision |
+| live Base Sepolia execution and live settlement observation | executed once and PASSED (run `live-20260828T214534z`); checksums committed under `evidence/`; see [`docs/LIVE_BASE_SEPOLIA_ACCEPTANCE.md`](docs/LIVE_BASE_SEPOLIA_ACCEPTANCE.md) |
 | x402 signed offers and receipts | preserved when present inside captured field values; not enabled in the deterministic fixture (see [§9](#9-relationship-to-peac-x402-and-base)) |
 | scheme `upto` | out of scope |
 | batch settlement | out of scope |
