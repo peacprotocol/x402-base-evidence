@@ -14,7 +14,7 @@ the repository holds none.
 
 - live, funded, production or reusable secret private keys;
 - wallet credentials and seed phrases;
-- real payment authorizations;
+- unconsumed or reusable payment authorizations;
 - private key material copied into evidence artifacts;
 - private key material printed, logged or recorded, in any mode.
 
