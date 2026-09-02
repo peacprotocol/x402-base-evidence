@@ -68,7 +68,9 @@ SHA-256 of the `SHA256SUMS` file itself is:
 56b069f3b891654adc260da50484b6743aed51e20ef659eca21c2dde204bf1e7
 ```
 
-Anyone holding a copy of the evidence directory can check it byte-for-byte:
+A clean clone contains this checksum list but not the evidence bytes; section 7 explains how to
+obtain them from the `v0.1.0` release asset. Anyone holding the evidence directory at the listed
+paths can then check it byte-for-byte from the repository root:
 
 ```sh
 shasum -a 256 -c evidence/base-sepolia/live-20260828T214534z/SHA256SUMS
@@ -87,7 +89,9 @@ The distinction matters and is easy to blur, so it is stated exactly:
   hashes above → the transaction facts above" is publication metadata: this document and the
   committed `SHA256SUMS` file assert it as provenance. It is checkable (the hashes recompute; the
   transaction is public on Base Sepolia), but it is not cryptographically signed inside
-  `record.jws`, and nothing here should be read as claiming that it is.
+  `record.jws`, and nothing here should be read as claiming that it is. The same holds for the
+  commit tagged `v0.1.0`, which publishes this bundle and this document: it is a second,
+  different provenance fact, and it is equally outside the signature.
 
 ## 5. Verifying the evidence
 
@@ -95,8 +99,11 @@ Verification is offline: files and a public key, nothing else — no network, no
 origin, no state shared with the run.
 
 ```sh
-pnpm verify --evidence out/live-20260828T214534z --public-key out/live-20260828T214534z-issuer.pub.json
+pnpm verify -- --evidence out/live-20260828T214534z --public-key out/live-20260828T214534z-issuer.pub.json
 ```
+
+The command reads the evidence directory and the public key file under `out/`, which a clean clone
+does not provide; section 7 covers obtaining them.
 
 Result for this run: **Verified.** The record signature checked under the published public key,
 every bound digest recomputed from the document beside it, both application-local binding
@@ -114,6 +121,7 @@ rather than vaguely rejecting the directory. The canonical evidence was not modi
 
 **Verification is reproducible.** Anyone with the evidence directory and the public key file can
 re-run the command above and get the same verdict, and can check the bytes against `SHA256SUMS`.
+Section 7 walks through doing exactly that from a clean clone.
 
 **The run itself is deliberately not byte-reproducible.** The evidence describes one live
 interaction: a fresh authorization nonce, real timestamps, the request components the origin
@@ -121,7 +129,86 @@ actually observed, and a real transaction. Re-running `pnpm demo:live` produces 
 evidence, never these bytes. Byte-reproducibility belongs to the offline fixture path, which is
 covered by the deterministic acceptance matrix (`src/acceptance-ids.ts`), not to live runs.
 
-## 7. What this run does NOT establish
+## 7. Reproducing the verification from a clean clone
+
+A clean clone of this repository does not contain the evidence bytes: `out/` is a run artifact and
+is never committed. The frozen post-run bytes are published as an asset of the GitHub release
+`v0.1.0`, so the verification can be reproduced from a clean clone in five steps.
+
+1. Clone and install from the committed lockfile:
+
+   ```sh
+   git clone https://github.com/peacprotocol/x402-base-evidence.git
+   cd x402-base-evidence
+   corepack enable
+   pnpm install --frozen-lockfile
+   ```
+
+2. Download `x402-base-evidence-live-20260828T214534z.tar.gz` from the `v0.1.0` release and check
+   its SHA-256 before extracting anything:
+
+   ```sh
+   echo "240dad2f7adcc5777aa63f5ecaffe02fc1b8b6a401a444d6771c730f6318381e  x402-base-evidence-live-20260828T214534z.tar.gz" | shasum -a 256 -c
+   ```
+
+3. Extract at the repository root. The archive recreates exactly the `out/...` paths that the
+   committed `SHA256SUMS` names, and places two untracked files beside them at the root:
+   `PROVENANCE.txt` (the run facts and the signed/unsigned boundary from section 4) and a copy of
+   `SHA256SUMS` that is byte-identical to the committed one.
+
+   ```sh
+   tar -xzf x402-base-evidence-live-20260828T214534z.tar.gz
+   ```
+
+4. Check every extracted file against the committed checksum list; all twelve lines must read
+   `OK`:
+
+   ```sh
+   shasum -a 256 -c evidence/base-sepolia/live-20260828T214534z/SHA256SUMS
+   ```
+
+5. Verify the record offline under the published public key; the expected verdict is
+   `Verified.`:
+
+   ```sh
+   pnpm verify -- --evidence out/live-20260828T214534z --public-key out/live-20260828T214534z-issuer.pub.json
+   ```
+
+To see a failure, change one field in a COPY of the evidence directory and verify the copy: the
+verdict becomes `Not verified.` and the `FAIL` lines name the document whose digest no longer
+recomputes. The extracted bundle is unchanged by any of this, and step 4 can be repeated afterwards.
+
+The verification needs no network access. The verifier reads the evidence directory and the key
+file and nothing else; running it with the repository's egress diagnostics installed
+(`node --import ./src/no-egress.ts src/flow/verify-evidence.ts --evidence ... --public-key ...`)
+reports the same verdict with no refused call.
+
+Reading the result correctly:
+
+- **Two commits, two facts.** The execution source commit `154ea6c5…` is the tree that produced
+  the run. The commit tagged `v0.1.0` is the repository state that publishes this bundle and this
+  document; the release notes name it. Neither commit is signed inside `record.jws` (section 4).
+  The verifier at the tagged commit reports three supplied-key consistency checks in addition to
+  those recorded in the frozen `verification-report.txt`, which was written by the verifier at the
+  execution source commit; the verdict is the same.
+- **The loopback origin is a run fact.** `payment-required.txt`, `payment-signature.txt` and
+  `request-binding.json` name `http://127.0.0.1:4021/v1/forecast?region=alpha&units=metric` as the
+  resource URL and request authority. That is the local example origin the run actually observed,
+  recorded as the observed origin authority; it is not a filesystem path, and nothing in the bundle
+  points at any machine.
+- **The published authorization cannot be presented again.** `payment-signature.txt` carries the
+  EIP-3009 authorization the payer signed for this one run. It was consumed by the settlement
+  transaction, the token contract's `authorizationState` reports its nonce as used, and its
+  validity window (`validBefore`) has passed.
+- **Same boundary as the run itself.** Base Sepolia only; sealed L2 inclusion, not L1 finality; one
+  RPC source; no claim about who holds the signing key; no adoption or endorsement by any party.
+  Section 8 states the full list.
+
+The asset is built deterministically from copies of the frozen bytes (members in sorted order,
+member timestamp fixed at `2026-08-28T21:45:40Z`, numeric owner `0:0`, modes `0644` and `0755`,
+gzip without a name or timestamp), so rebuilding it from the same bytes yields the same SHA-256.
+
+## 8. What this run does NOT establish
 
 - **Not L1 finality.** The observation level is `l2_block_inclusion`: a named RPC source reported
   the transaction in a sealed L2 block. No claim is made about L1 batch inclusion, L1 finality,
