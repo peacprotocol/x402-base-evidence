@@ -14,7 +14,7 @@ the repository holds none.
 
 - live, funded, production or reusable secret private keys;
 - wallet credentials and seed phrases;
-- real payment authorizations;
+- unconsumed or reusable payment authorizations;
 - private key material copied into evidence artifacts;
 - private key material printed, logged or recorded, in any mode.
 
@@ -54,7 +54,11 @@ anchors; and their addresses MUST NOT be treated as controlled production identi
 Payment signatures, payer identifiers, receipts and transaction references can identify people and
 counterparties.
 
-- Public evidence is digest-only by default; raw artifacts stay private outside fixture mode.
+- Public evidence is digest-only by default, and raw live artifacts remain private by default. An
+  explicitly reviewed Base Sepolia testnet acceptance bundle MAY be published when it contains no
+  reusable secret and no private third-party data, its payment authorization has been consumed on
+  chain and cannot be presented again, and the publication is documented in the acceptance
+  document (`docs/LIVE_BASE_SEPOLIA_ACCEPTANCE.md`).
 - Validator diagnostics never retain message text produced over attacker-controlled input, and are
   bounded in count, depth and total size, so an untrusted payload cannot inflate what is logged or
   persisted.
