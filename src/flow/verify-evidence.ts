@@ -38,8 +38,17 @@
 import { join } from 'node:path';
 import { verifyLocal, computeJsonDocumentDigestJcs } from '@peac/protocol';
 import type { JsonValue } from '@peac/kernel';
+import type { PaymentPayload, PaymentRequired, SettleResponse } from '@x402/core/types';
+import { extractPaymentIdentifier } from '@x402/extensions/payment-identifier';
 import { coerceDigest, digestBytes, type Sha256Digest } from '../digest.ts';
 import { decodeStrictUtf8, parseStrictJson, type StrictJsonRefusal } from '../strict-json.ts';
+import {
+  captureObservedX402Artifact,
+  X402_STAGES,
+  type CapturedX402Artifact,
+  type X402HeaderName,
+} from '../x402-header.ts';
+import { ComponentError, componentsFromAbsoluteUri } from '../components.ts';
 import { checkPresence, EVIDENCE_ARTIFACTS, type EvidenceArtifact } from './presence.ts';
 import {
   ARTIFACT_CONTAINERS,
@@ -63,6 +72,7 @@ import {
   type BaseChainObservationV1,
   type ComparisonVerdict,
 } from './observe-settlement.ts';
+import { sameAddress } from './observe-transaction.ts';
 import {
   InvalidPublicKeyFileError,
   PUBLIC_KEY_ALGORITHM,
@@ -80,9 +90,38 @@ import {
  */
 const OBSERVED_SCHEME = 'exact';
 
+/**
+ * The verifier profile this build of the verifier implements.
+ *
+ * A profile is a version of the check set, not a version of this file. Profile 1 was the v0.1.0
+ * check set: no native-artifact agreement, no chain-observation schema. Profile 2 adds both. A
+ * reader comparing two reports needs to know which check set produced each one before comparing
+ * their outcomes at all.
+ */
+export const VERIFIER_PROFILE = 'x402-base-evidence/offline-verification/2';
+
+/**
+ * What a check is checking, so a reader can tell four different kinds of question apart at a
+ * glance: whether the bytes are intact under the supplied key, whether a document has the shape
+ * this example produces, whether documents that repeat a fact agree with each other, and whether
+ * the native x402 artifacts this evidence captured agree with what the record and the observation
+ * say about them.
+ *
+ *   integrity     record signature/schema; every bound digest recomputed; the origin result body
+ *                 digest; what a supplied key file declares about itself.
+ *   structure     record type; extension groups; local-profile schema checks; the artifact
+ *                 presence contract; chain observation profile/scheme/attribution; settlement
+ *                 facts against the outcome; rpc observation basis checks; terminal state.
+ *   consistency   cross-document agreement (network/terminal state/asset/amount/digests); the
+ *                 expectation comparison recomputed; the transfer verdict evaluated.
+ *   native        agreement between the captured native x402 artifacts and the record.
+ */
+export type VerificationCategory = 'integrity' | 'structure' | 'consistency' | 'native';
+
 export interface VerificationCheck {
   readonly name: string;
   readonly ok: boolean;
+  readonly category: VerificationCategory;
   /** Bounded explanation. Never quotes attacker-controlled document text. */
   readonly detail: string;
 }
@@ -103,13 +142,25 @@ export interface VerificationWarning {
 
 export interface EvidenceVerificationReport {
   readonly ok: boolean;
+  /** Which check set produced this report. See `VERIFIER_PROFILE`. */
+  readonly profile: typeof VERIFIER_PROFILE;
   readonly checks: readonly VerificationCheck[];
   /** Never affects `ok`. See `VerificationWarning`. */
   readonly warnings: readonly VerificationWarning[];
 }
 
-const pass = (name: string, detail = ''): VerificationCheck => ({ name, ok: true, detail });
-const fail = (name: string, detail: string): VerificationCheck => ({ name, ok: false, detail });
+const pass = (name: string, category: VerificationCategory, detail = ''): VerificationCheck => ({
+  name,
+  ok: true,
+  category,
+  detail,
+});
+const fail = (name: string, category: VerificationCategory, detail: string): VerificationCheck => ({
+  name,
+  ok: false,
+  category,
+  detail,
+});
 
 /**
  * What reading one artifact produced.
@@ -213,9 +264,11 @@ export async function verifyEvidence(
     if (state.kind === 'refused') {
       return {
         ok: false,
+        profile: VERIFIER_PROFILE,
         checks: [
           fail(
             'nested artifact directories are directories',
+            'structure',
             `${container} was refused (${state.refusal}: ${state.detail})`,
           ),
         ],
@@ -237,9 +290,11 @@ export async function verifyEvidence(
   if (unreadable.length > 0) {
     return {
       ok: false,
+      profile: VERIFIER_PROFILE,
       checks: [
         fail(
           'every artifact is readable',
+          'structure',
           `refused, and absence must not be assumed: ${unreadable.join('; ')}`,
         ),
       ],
@@ -285,7 +340,12 @@ export async function verifyEvidence(
 
   const recordBytes = present.get('record.jws');
   if (recordBytes === undefined) {
-    return { ok: false, checks: [fail('record present', 'record.jws is missing')], warnings };
+    return {
+      ok: false,
+      profile: VERIFIER_PROFILE,
+      checks: [fail('record present', 'structure', 'record.jws is missing')],
+      warnings,
+    };
   }
   // Decoded fatally, like every other document here. A record is base64url text, so bytes that are
   // not valid UTF-8 are not a record; replacing what is malformed would hand the verification
@@ -294,7 +354,8 @@ export async function verifyEvidence(
   if (recordText === undefined) {
     return {
       ok: false,
-      checks: [fail('record signature and schema', 'the record bytes are not valid UTF-8')],
+      profile: VERIFIER_PROFILE,
+      checks: [fail('record signature and schema', 'integrity', 'the record bytes are not valid UTF-8')],
       warnings,
     };
   }
@@ -308,18 +369,22 @@ export async function verifyEvidence(
   } catch {
     return {
       ok: false,
-      checks: [fail('record signature and schema', 'the record could not be read as a PEAC record')],
+      profile: VERIFIER_PROFILE,
+      checks: [
+        fail('record signature and schema', 'integrity', 'the record could not be read as a PEAC record'),
+      ],
       warnings,
     };
   }
   if (!verified.valid) {
     return {
       ok: false,
-      checks: [fail('record signature and schema', `${verified.code}`)],
+      profile: VERIFIER_PROFILE,
+      checks: [fail('record signature and schema', 'integrity', `${verified.code}`)],
       warnings,
     };
   }
-  checks.push(pass('record signature and schema', `verified under kid ${verified.kid}`));
+  checks.push(pass('record signature and schema', 'integrity', `verified under kid ${verified.kid}`));
 
   const claims = verified.claims as unknown as {
     iss?: unknown;
@@ -339,27 +404,30 @@ export async function verifyEvidence(
   if (suppliedKey !== undefined) {
     checks.push(
       suppliedKey.algorithm === PUBLIC_KEY_ALGORITHM
-        ? pass('supplied key algorithm', PUBLIC_KEY_ALGORITHM)
+        ? pass('supplied key algorithm', 'integrity', PUBLIC_KEY_ALGORITHM)
         : fail(
             'supplied key algorithm',
+            'integrity',
             `the key file declares ${describeBound(suppliedKey.algorithm)}, ` +
               `and this example verifies only ${PUBLIC_KEY_ALGORITHM}`,
           ),
     );
     checks.push(
       suppliedKey.kid === verified.kid
-        ? pass('supplied key identifier matches the record', verified.kid)
+        ? pass('supplied key identifier matches the record', 'integrity', verified.kid)
         : fail(
             'supplied key identifier matches the record',
+            'integrity',
             `the key file names ${describeBound(suppliedKey.kid)}, ` +
               `the record names ${describeBound(verified.kid)}`,
           ),
     );
     checks.push(
       suppliedKey.issuer === claims.iss
-        ? pass('supplied key issuer matches the record', suppliedKey.issuer)
+        ? pass('supplied key issuer matches the record', 'integrity', suppliedKey.issuer)
         : fail(
             'supplied key issuer matches the record',
+            'integrity',
             `the key file names ${describeBound(suppliedKey.issuer)}, ` +
               `the record names ${describeBound(claims.iss)}`,
           ),
@@ -367,17 +435,17 @@ export async function verifyEvidence(
   }
   checks.push(
     claims.type === RECORD_TYPE
-      ? pass('record type', RECORD_TYPE)
-      : fail('record type', `expected ${RECORD_TYPE}, record carries ${String(claims.type)}`),
+      ? pass('record type', 'structure', RECORD_TYPE)
+      : fail('record type', 'structure', `expected ${RECORD_TYPE}, record carries ${String(claims.type)}`),
   );
 
   const commerce = claims.extensions?.[COMMERCE_GROUP];
   const evidence = claims.extensions?.[PAYMENT_EVIDENCE_GROUP];
   if (commerce === undefined || evidence === undefined) {
-    checks.push(fail('extension groups', 'the record is missing a required extension group'));
-    return { ok: false, checks, warnings };
+    checks.push(fail('extension groups', 'structure', 'the record is missing a required extension group'));
+    return { ok: false, profile: VERIFIER_PROFILE, checks, warnings };
   }
-  checks.push(pass('extension groups', `${COMMERCE_GROUP}, ${PAYMENT_EVIDENCE_GROUP}`));
+  checks.push(pass('extension groups', 'structure', `${COMMERCE_GROUP}, ${PAYMENT_EVIDENCE_GROUP}`));
 
   /** Recompute one bound digest from the document that sits beside the record. */
   const recomputeJson = async (
@@ -389,13 +457,13 @@ export async function verifyEvidence(
     if (claimed === undefined) {
       checks.push(
         bytes === undefined
-          ? pass(name, 'not bound and not present')
-          : fail(name, `${artifact} is present but the record binds no digest for it`),
+          ? pass(name, 'integrity', 'not bound and not present')
+          : fail(name, 'integrity', `${artifact} is present but the record binds no digest for it`),
       );
       return;
     }
     if (bytes === undefined) {
-      checks.push(fail(name, `the record binds a digest but ${artifact} is missing`));
+      checks.push(fail(name, 'integrity', `the record binds a digest but ${artifact} is missing`));
       return;
     }
     const parsed = readJsonArtifact(artifact);
@@ -405,6 +473,7 @@ export async function verifyEvidence(
       checks.push(
         fail(
           name,
+          'integrity',
           parsed.kind === 'refused'
             ? refusedDetail(artifact, parsed.refusal)
             : `${artifact} is missing`,
@@ -415,8 +484,8 @@ export async function verifyEvidence(
     const recomputed = coerceDigest(await computeJsonDocumentDigestJcs(parsed.value as JsonValue));
     checks.push(
       recomputed === claimed
-        ? pass(name, recomputed)
-        : fail(name, `recomputed ${recomputed}, record binds ${describeBound(claimed)}`),
+        ? pass(name, 'integrity', recomputed)
+        : fail(name, 'integrity', `recomputed ${recomputed}, record binds ${describeBound(claimed)}`),
     );
   };
 
@@ -443,7 +512,11 @@ export async function verifyEvidence(
     const parsed = readJsonArtifact(artifact);
     if (parsed.kind !== 'parsed') return;
     const result = validateLocalProfile(document, parsed.value);
-    checks.push(result.ok ? pass(name, 'matches the example-local schema') : fail(name, result.detail));
+    checks.push(
+      result.ok
+        ? pass(name, 'structure', 'matches the example-local schema')
+        : fail(name, 'structure', result.detail),
+    );
   };
 
   await recomputeJson(
@@ -467,6 +540,10 @@ export async function verifyEvidence(
     'chain-observation.json',
     evidence['chain_observation_digest'],
   );
+  // Schema-only: a separate question from the digest above. The digest says which bytes the
+  // record bound; this says whether those bytes have the shape this example's own observation
+  // profile produces, exactly as the two binding documents are already held to their schemas.
+  checkLocalProfile('chain observation local profile schema', 'chain-observation.json', 'chain-observation');
 
   /** Recompute an observed field value digest from the bytes recorded beside the record. */
   const recomputeObserved = (name: string, artifact: EvidenceArtifact, claimed: unknown): void => {
@@ -474,20 +551,20 @@ export async function verifyEvidence(
     if (claimed === undefined) {
       checks.push(
         bytes === undefined
-          ? pass(name, 'not bound and not present')
-          : fail(name, `${artifact} is present but the record binds no digest for it`),
+          ? pass(name, 'integrity', 'not bound and not present')
+          : fail(name, 'integrity', `${artifact} is present but the record binds no digest for it`),
       );
       return;
     }
     if (bytes === undefined) {
-      checks.push(fail(name, `the record binds a digest but ${artifact} is missing`));
+      checks.push(fail(name, 'integrity', `the record binds a digest but ${artifact} is missing`));
       return;
     }
     const recomputed = digestBytes(bytes);
     checks.push(
       recomputed === claimed
-        ? pass(name, recomputed)
-        : fail(name, `recomputed ${recomputed}, record binds ${describeBound(claimed)}`),
+        ? pass(name, 'integrity', recomputed)
+        : fail(name, 'integrity', `recomputed ${recomputed}, record binds ${describeBound(claimed)}`),
     );
   };
 
@@ -514,19 +591,22 @@ export async function verifyEvidence(
   if (resultBinding.kind !== 'absent') {
     if (resultBinding.kind === 'refused') {
       const detail = refusedDetail('origin-result-binding.json', resultBinding.refusal);
-      checks.push(fail('origin result body', detail));
+      checks.push(fail('origin result body', 'integrity', detail));
     } else if (!isJsonObject(resultBinding.value)) {
-      checks.push(fail('origin result body', 'the result binding is not a JSON object'));
+      checks.push(fail('origin result body', 'integrity', 'the result binding is not a JSON object'));
     } else if (bodyBytes === undefined) {
-      checks.push(fail('origin result body', 'the result binding exists but the body is missing'));
+      checks.push(
+        fail('origin result body', 'integrity', 'the result binding exists but the body is missing'),
+      );
     } else {
       const boundBodyDigest = resultBinding.value['bodyDigest'];
       const recomputed: Sha256Digest = digestBytes(bodyBytes);
       checks.push(
         recomputed === boundBodyDigest
-          ? pass('origin result body', recomputed)
+          ? pass('origin result body', 'integrity', recomputed)
           : fail(
               'origin result body',
+              'integrity',
               `recomputed ${recomputed}, binding names ${describeBound(boundBodyDigest)}`,
             ),
       );
@@ -537,15 +617,16 @@ export async function verifyEvidence(
   // chosen after the fact to match whatever files happen to be there.
   const terminalState = evidence['terminal_state'];
   if (!isTerminalState(terminalState)) {
-    checks.push(fail('terminal state', 'the record carries no recognised terminal state'));
-    return { ok: false, checks, warnings };
+    checks.push(fail('terminal state', 'structure', 'the record carries no recognised terminal state'));
+    return { ok: false, profile: VERIFIER_PROFILE, checks, warnings };
   }
   const violations = checkPresence(terminalState, new Set(present.keys()));
   checks.push(
     violations.length === 0
-      ? pass('artifact presence contract', `consistent with ${terminalState}`)
+      ? pass('artifact presence contract', 'structure', `consistent with ${terminalState}`)
       : fail(
           'artifact presence contract',
+          'structure',
           violations
             .map((v) => `${v.artifact} is ${v.present ? 'present' : 'missing'} but declared ${v.expectation}`)
             .join('; '),
@@ -557,10 +638,14 @@ export async function verifyEvidence(
   const observationRead = readJsonArtifact('chain-observation.json');
   if (observationRead.kind === 'refused') {
     checks.push(
-      fail('chain observation', refusedDetail('chain-observation.json', observationRead.refusal)),
+      fail(
+        'chain observation',
+        'structure',
+        refusedDetail('chain-observation.json', observationRead.refusal),
+      ),
     );
   } else if (observationRead.kind === 'parsed' && !isJsonObject(observationRead.value)) {
-    checks.push(fail('chain observation', 'chain-observation.json is not a JSON object'));
+    checks.push(fail('chain observation', 'structure', 'chain-observation.json is not a JSON object'));
   } else if (observationRead.kind === 'parsed') {
     const observationDocument = observationRead.value as Record<string, unknown>;
     const expectation = isJsonObject(observationDocument['payment_expectation'])
@@ -578,18 +663,20 @@ export async function verifyEvidence(
     // or another scheme, is not the document the rest of these checks are written against.
     checks.push(
       observationDocument['profile'] === PROFILE_CHAIN_OBSERVATION
-        ? pass('chain observation local profile', PROFILE_CHAIN_OBSERVATION)
+        ? pass('chain observation local profile', 'structure', PROFILE_CHAIN_OBSERVATION)
         : fail(
             'chain observation local profile',
+            'structure',
             `expected ${PROFILE_CHAIN_OBSERVATION}, the document names ` +
               `${describeBound(observationDocument['profile'])}`,
           ),
     );
     checks.push(
       observationDocument['scheme'] === OBSERVED_SCHEME
-        ? pass('chain observation scheme', OBSERVED_SCHEME)
+        ? pass('chain observation scheme', 'structure', OBSERVED_SCHEME)
         : fail(
             'chain observation scheme',
+            'structure',
             `this example records the ${OBSERVED_SCHEME} scheme only, the document names ` +
               `${describeBound(observationDocument['scheme'])}`,
           ),
@@ -598,15 +685,17 @@ export async function verifyEvidence(
       expectation !== undefined && report !== undefined
         ? pass(
             'expectation and observation are separately attributed',
+            'structure',
             'payment_expectation and chain_observation both present with their sources',
           )
         : fail(
             'expectation and observation are separately attributed',
+            'structure',
             'the document does not carry both attributed objects',
           ),
     );
     if (expectation === undefined || report === undefined) {
-      return { ok: false, checks, warnings };
+      return { ok: false, profile: VERIFIER_PROFILE, checks, warnings };
     }
 
     const settled = report['settlement_outcome'] === 'succeeded';
@@ -615,10 +704,12 @@ export async function verifyEvidence(
       settled === hasTransaction
         ? pass(
             'settlement facts match the outcome',
+            'structure',
             settled ? 'settled, transaction recorded' : 'not settled, no transaction recorded',
           )
         : fail(
             'settlement facts match the outcome',
+            'structure',
             settled
               ? 'settlement succeeded but no transaction reference is recorded'
               : 'a transaction reference is recorded for a settlement that did not succeed',
@@ -641,9 +732,14 @@ export async function verifyEvidence(
         rpc['transaction_hash'] === report['transaction_hash'];
       checks.push(
         sameTransaction
-          ? pass('rpc observation transaction', 'it describes the transaction the settlement recorded')
+          ? pass(
+              'rpc observation transaction',
+              'structure',
+              'it describes the transaction the settlement recorded',
+            )
           : fail(
               'rpc observation transaction',
+              'structure',
               'it describes a transaction the settlement observation does not record',
             ),
       );
@@ -653,12 +749,14 @@ export async function verifyEvidence(
           (typeof rpc['block_number'] === 'string' && typeof rpc['block_hash'] === 'string')
           ? pass(
               'rpc inclusion claim carries its basis',
+              'structure',
               claimsInclusion
                 ? 'l2_block_inclusion with sealed block placement recorded'
                 : 'no inclusion level is claimed',
             )
           : fail(
               'rpc inclusion claim carries its basis',
+              'structure',
               'the observation claims l2_block_inclusion without recording the sealed block data',
             ),
       );
@@ -706,7 +804,7 @@ export async function verifyEvidence(
       ? (observationDocument['comparison'] as Record<string, unknown>)
       : undefined;
     if (recordedComparison === undefined) {
-      checks.push(fail('expectation comparison', 'the document records no comparison object'));
+      checks.push(fail('expectation comparison', 'consistency', 'the document records no comparison object'));
     } else {
       const recomputed = compareExpectationToObservation({
         payment_expectation: expectation,
@@ -723,12 +821,14 @@ export async function verifyEvidence(
         disagreements.length === 0
           ? pass(
               'expectation comparison',
+              'consistency',
               Object.entries(recomputed)
                 .map(([field, verdict]) => `${field}=${verdict}`)
                 .join(' '),
             )
           : fail(
               'expectation comparison',
+              'consistency',
               disagreements
                 .map(
                   ([field, verdict]) =>
@@ -744,9 +844,10 @@ export async function verifyEvidence(
       if (rpc !== undefined && typeof rpc['receipt_status'] === 'string') {
         checks.push(
           recomputed.transfer_event !== 'not_evaluated'
-            ? pass('transfer event verdict evaluated', recomputed.transfer_event)
+            ? pass('transfer event verdict evaluated', 'consistency', recomputed.transfer_event)
             : fail(
                 'transfer event verdict evaluated',
+                'consistency',
                 'an RPC receipt is recorded but the transfer-event verdict was not evaluated',
               ),
         );
@@ -770,14 +871,17 @@ export async function verifyEvidence(
      */
     const agreeOnValue = (name: string, recorded: unknown, observed: unknown): void => {
       if (typeof recorded !== 'string' || typeof observed !== 'string') {
-        checks.push(fail(name, 'the value is absent on one side, so there is nothing to compare'));
+        checks.push(
+          fail(name, 'consistency', 'the value is absent on one side, so there is nothing to compare'),
+        );
         return;
       }
       checks.push(
         recorded === observed
-          ? pass(name, describeBound(recorded))
+          ? pass(name, 'consistency', describeBound(recorded))
           : fail(
               name,
+              'consistency',
               `the record carries ${describeBound(recorded)}, ` +
                 `the observation carries ${describeBound(observed)}`,
             ),
@@ -799,18 +903,21 @@ export async function verifyEvidence(
       absentDetail: string,
     ): void => {
       if (recorded === undefined && observed === undefined) {
-        checks.push(pass(name, absentDetail));
+        checks.push(pass(name, 'consistency', absentDetail));
         return;
       }
       if (typeof recorded !== 'string' || typeof observed !== 'string') {
-        checks.push(fail(name, 'it is recorded in one of the two documents and not in the other'));
+        checks.push(
+          fail(name, 'consistency', 'it is recorded in one of the two documents and not in the other'),
+        );
         return;
       }
       checks.push(
         recorded === observed
-          ? pass(name, describeBound(recorded))
+          ? pass(name, 'consistency', describeBound(recorded))
           : fail(
               name,
+              'consistency',
               `one document names ${describeBound(recorded)}, ` +
                 `the other names ${describeBound(observed)}`,
             ),
@@ -862,9 +969,418 @@ export async function verifyEvidence(
         );
       }
     }
+
+    /**
+     * NATIVE-ARTIFACT AGREEMENT. Does the payment this evidence captured, decoded on its own
+     * terms, actually say what the record and the observation say it says?
+     *
+     * Everything above this point treats the three captured x402 field values as opaque bytes: it
+     * digests them and checks that the digest the record binds recomputes. That proves the bytes
+     * are the ones the record named. It says nothing about their CONTENTS -- a producer can
+     * re-issue a record whose native payment-signature names one amount while the record and the
+     * observation both name another, refresh the bound digest, and every check above still
+     * passes. These checks decode the captured artifacts and compare the decoded values against
+     * the record and the observation directly, never re-serializing anything and never quoting
+     * document text beyond `describeBound`.
+     *
+     * HELD VS PRESERVED. `held` asks whether this evidence describes a settled payment. When it
+     * does, a native artifact disagreeing with the record or the observation is a verdict: two
+     * things that should describe one payment do not. When it does not -- a rejected or malformed
+     * payment attempt is exactly as legitimate a thing to hold evidence of as a settled one -- the
+     * native content was never a settled payment for the expectation to have agreed or disagreed
+     * with, so it is reported as preserved evidence of the attempt rather than measured against
+     * an expectation it never had to satisfy.
+     */
+    const held = terminalState === 'response_write_attempted';
+
+    /** A bounded rendering of one decode attempt's stage outcomes. */
+    const stageSummary = (artifact: CapturedX402Artifact): string =>
+      X402_STAGES.map((stage) => `${stage}=${artifact.stages[stage]}`).join(' ');
+
+    type NativeDecode =
+      | { readonly kind: 'absent' }
+      | { readonly kind: 'undecodable'; readonly reason: string }
+      | { readonly kind: 'decoded'; readonly artifact: CapturedX402Artifact };
+
+    /**
+     * Decode one present native artifact. Never throws: `captureObservedX402Artifact` throws only
+     * for input that cannot be treated as an observed field value at all (non-visible-ASCII, or
+     * past the declared size bound), which is refused here as "not decodable" rather than aborting
+     * the whole verification run. Every other malformed shape is a captured, staged result.
+     */
+    const decodeNative = async (
+      name: X402HeaderName,
+      artifact: EvidenceArtifact,
+      capturePoint: 'origin_request_after_http_parsing' | 'origin_response_before_gateway',
+    ): Promise<NativeDecode> => {
+      const bytes = present.get(artifact);
+      if (bytes === undefined) return { kind: 'absent' };
+      const text = decodeStrictUtf8(bytes);
+      if (text === undefined) {
+        return { kind: 'undecodable', reason: 'the artifact bytes are not valid UTF-8' };
+      }
+      try {
+        const captured = await captureObservedX402Artifact({
+          name,
+          observedValue: text,
+          capturePoint,
+          httpVersion: '1.1',
+        });
+        return { kind: 'decoded', artifact: captured };
+      } catch (e) {
+        return {
+          kind: 'undecodable',
+          reason: e instanceof Error ? describeBound(e.message) : 'the artifact could not be captured',
+        };
+      }
+    };
+
+    const requiredDecode = await decodeNative(
+      'payment-required',
+      'artifacts/payment-required.txt',
+      'origin_response_before_gateway',
+    );
+    const signatureDecode = await decodeNative(
+      'payment-signature',
+      'artifacts/payment-signature.txt',
+      'origin_request_after_http_parsing',
+    );
+    const responseDecode = await decodeNative(
+      'payment-response',
+      'artifacts/payment-response.txt',
+      'origin_response_before_gateway',
+    );
+
+    if (held) {
+      const REQUIRED_STAGES = ['transport', 'json', 'duplicate-members', 'upstream-schema'] as const;
+      const SIGNATURE_STAGES = [
+        'transport',
+        'json',
+        'duplicate-members',
+        'upstream-schema',
+        'scheme-payload',
+      ] as const;
+      const RESPONSE_STAGES = ['transport', 'json', 'duplicate-members'] as const;
+
+      /** Emit the one named decode check for a present artifact. Statement form, not a ternary
+       * chain, so the discriminated union narrows on every branch. */
+      const emitDecodeCheck = (checkName: string, decode: NativeDecode, ok: boolean): void => {
+        if (decode.kind === 'absent') return;
+        if (ok) {
+          if (decode.kind === 'decoded') checks.push(pass(checkName, 'native', stageSummary(decode.artifact)));
+          return;
+        }
+        if (decode.kind === 'undecodable') {
+          checks.push(fail(checkName, 'native', decode.reason));
+        } else {
+          checks.push(
+            fail(checkName, 'native', `stage requirements not satisfied: ${stageSummary(decode.artifact)}`),
+          );
+        }
+      };
+
+      const requiredOk =
+        requiredDecode.kind === 'decoded' &&
+        REQUIRED_STAGES.every((stage) => requiredDecode.artifact.stages[stage] === 'accepted');
+      emitDecodeCheck('native payment-required decodes', requiredDecode, requiredOk);
+
+      const signatureOk =
+        signatureDecode.kind === 'decoded' &&
+        SIGNATURE_STAGES.every((stage) => signatureDecode.artifact.stages[stage] === 'accepted') &&
+        signatureDecode.artifact.stages.extensions !== 'rejected';
+      emitDecodeCheck('native payment-signature decodes', signatureDecode, signatureOk);
+
+      const responseOk =
+        responseDecode.kind === 'decoded' &&
+        RESPONSE_STAGES.every((stage) => responseDecode.artifact.stages[stage] === 'accepted') &&
+        responseDecode.artifact.localStructural?.localStructuralStatus === 'accepted';
+      emitDecodeCheck('native payment-response decodes', responseDecode, responseOk);
+
+      // Dependent checks: no cascade. A decode failure already produced its one named failure
+      // above, and none of the checks below is emitted for an artifact that did not decode.
+      if (signatureOk && signatureDecode.kind === 'decoded') {
+        const payload = signatureDecode.artifact.decoded as unknown as PaymentPayload;
+        const accepted = payload.accepted as
+          | {
+              readonly scheme?: unknown;
+              readonly network?: unknown;
+              readonly asset?: unknown;
+              readonly amount?: unknown;
+              readonly payTo?: unknown;
+            }
+          | undefined;
+
+        // 4. payment-signature terms match the expectation.
+        const acceptedAsset = accepted?.asset;
+        const acceptedPayTo = accepted?.payTo;
+        const termsOk =
+          accepted?.scheme === 'exact' &&
+          accepted.network === expectation['network'] &&
+          typeof acceptedAsset === 'string' &&
+          typeof expectation['asset'] === 'string' &&
+          sameAddress(acceptedAsset, expectation['asset']) &&
+          accepted.amount === expectation['amount_base_units'] &&
+          typeof acceptedPayTo === 'string' &&
+          typeof expectation['recipient'] === 'string' &&
+          sameAddress(acceptedPayTo, expectation['recipient']);
+        checks.push(
+          termsOk
+            ? pass(
+                'payment-signature terms match the expectation',
+                'native',
+                'scheme, network, asset, amount and recipient agree with the expectation',
+              )
+            : fail(
+                'payment-signature terms match the expectation',
+                'native',
+                `the native accepted terms disagree with the expectation: scheme ${describeBound(accepted?.scheme)}, ` +
+                  `network ${describeBound(accepted?.network)}, asset ${describeBound(acceptedAsset)}, ` +
+                  `amount ${describeBound(accepted?.amount)}, payTo ${describeBound(acceptedPayTo)}`,
+              ),
+        );
+
+        // 5. payment-signature authorization matches the expectation.
+        const rawPayload = payload.payload as Record<string, unknown> | undefined;
+        const rawAuthorization = isJsonObject(rawPayload?.['authorization'])
+          ? (rawPayload['authorization'] as Record<string, unknown>)
+          : undefined;
+        const expectationPayer = expectation['payer'];
+        const fromOk =
+          typeof rawAuthorization?.['from'] === 'string' &&
+          typeof expectationPayer === 'string' &&
+          sameAddress(rawAuthorization['from'] as string, expectationPayer);
+        const toOk =
+          typeof rawAuthorization?.['to'] === 'string' &&
+          typeof expectation['recipient'] === 'string' &&
+          sameAddress(rawAuthorization['to'] as string, expectation['recipient'] as string);
+        const valueOk = rawAuthorization?.['value'] === expectation['amount_base_units'];
+        let digestOk = false;
+        if (rawAuthorization !== undefined) {
+          try {
+            digestOk =
+              coerceDigest(await computeJsonDocumentDigestJcs(rawAuthorization as JsonValue)) ===
+              expectation['authorization_digest'];
+          } catch {
+            digestOk = false;
+          }
+        }
+        checks.push(
+          fromOk && toOk && valueOk && digestOk
+            ? pass(
+                'payment-signature authorization matches the expectation',
+                'native',
+                'from, to, value and the authorization digest agree with the expectation',
+              )
+            : fail(
+                'payment-signature authorization matches the expectation',
+                'native',
+                `the native authorization disagrees with the expectation: from ${describeBound(rawAuthorization?.['from'])}, ` +
+                  `to ${describeBound(rawAuthorization?.['to'])}, value ${describeBound(rawAuthorization?.['value'])}, ` +
+                  `authorization digest agreement ${digestOk}`,
+              ),
+        );
+
+        // 6. payment-signature identifier matches the record reference.
+        const paymentIdentifier = extractPaymentIdentifier(payload);
+        const recordReference = commerce['reference'];
+        if (paymentIdentifier === null && recordReference === undefined) {
+          checks.push(
+            pass(
+              'payment-signature identifier matches the record reference',
+              'native',
+              'no payment identifier was used',
+            ),
+          );
+        } else if (paymentIdentifier === null || recordReference === undefined) {
+          checks.push(
+            fail(
+              'payment-signature identifier matches the record reference',
+              'native',
+              `the identifier is present on one side and not the other: native ${describeBound(paymentIdentifier)}, ` +
+                `record ${describeBound(recordReference)}`,
+            ),
+          );
+        } else {
+          checks.push(
+            paymentIdentifier === recordReference
+              ? pass(
+                  'payment-signature identifier matches the record reference',
+                  'native',
+                  describeBound(paymentIdentifier),
+                )
+              : fail(
+                  'payment-signature identifier matches the record reference',
+                  'native',
+                  `native names ${describeBound(paymentIdentifier)}, record names ${describeBound(recordReference)}`,
+                ),
+          );
+        }
+
+        // 7. payment-signature resource matches the request binding.
+        const requestBindingRead = readJsonArtifact('request-binding.json');
+        if (requestBindingRead.kind === 'parsed' && isJsonObject(requestBindingRead.value)) {
+          const bindingComponents = isJsonObject(requestBindingRead.value['components'])
+            ? (requestBindingRead.value['components'] as Record<string, unknown>)
+            : undefined;
+          const resourceUrl = isJsonObject(payload.resource)
+            ? (payload.resource as { readonly url?: unknown }).url
+            : undefined;
+          if (bindingComponents === undefined || typeof resourceUrl !== 'string') {
+            checks.push(
+              fail(
+                'payment-signature resource matches the request binding',
+                'native',
+                'the request binding carries no components, or the native resource carries no url',
+              ),
+            );
+          } else {
+            try {
+              const method =
+                typeof bindingComponents['@method'] === 'string'
+                  ? (bindingComponents['@method'] as string)
+                  : 'GET';
+              const derived = componentsFromAbsoluteUri({ method, absoluteUri: resourceUrl });
+              const agree =
+                derived['@scheme'] === bindingComponents['@scheme'] &&
+                derived['@authority'] === bindingComponents['@authority'] &&
+                derived['@path'] === bindingComponents['@path'] &&
+                derived['@query'] === bindingComponents['@query'];
+              checks.push(
+                agree
+                  ? pass(
+                      'payment-signature resource matches the request binding',
+                      'native',
+                      'scheme, authority, path and query agree',
+                    )
+                  : fail(
+                      'payment-signature resource matches the request binding',
+                      'native',
+                      'the resource the native payment names does not match the request binding components',
+                    ),
+              );
+            } catch (e) {
+              checks.push(
+                fail(
+                  'payment-signature resource matches the request binding',
+                  'native',
+                  e instanceof ComponentError
+                    ? `the native resource url could not be read as request components: ${describeBound(e.message)}`
+                    : 'the native resource url could not be read as request components',
+                ),
+              );
+            }
+          }
+        }
+
+        // 8. payment-required advertises the accepted terms.
+        if (requiredOk && requiredDecode.kind === 'decoded') {
+          const required = requiredDecode.artifact.decoded as unknown as PaymentRequired;
+          const requiredResourceUrl = isJsonObject(required.resource)
+            ? (required.resource as { readonly url?: unknown }).url
+            : undefined;
+          const signatureResourceUrl = isJsonObject(payload.resource)
+            ? (payload.resource as { readonly url?: unknown }).url
+            : undefined;
+          const accepts = Array.isArray(required.accepts) ? required.accepts : [];
+          const advertised = accepts.some((entry) => {
+            if (typeof entry !== 'object' || entry === null) return false;
+            const candidate = entry as {
+              readonly scheme?: unknown;
+              readonly network?: unknown;
+              readonly asset?: unknown;
+              readonly amount?: unknown;
+              readonly payTo?: unknown;
+            };
+            return (
+              candidate.scheme === accepted?.scheme &&
+              candidate.network === accepted?.network &&
+              typeof candidate.asset === 'string' &&
+              typeof acceptedAsset === 'string' &&
+              sameAddress(candidate.asset, acceptedAsset) &&
+              candidate.amount === accepted?.amount &&
+              typeof candidate.payTo === 'string' &&
+              typeof acceptedPayTo === 'string' &&
+              sameAddress(candidate.payTo, acceptedPayTo)
+            );
+          });
+          const urlsAgree =
+            typeof requiredResourceUrl === 'string' && requiredResourceUrl === signatureResourceUrl;
+          checks.push(
+            urlsAgree && advertised
+              ? pass(
+                  'payment-required advertises the accepted terms',
+                  'native',
+                  'the resource url and the accepted terms both appear in the payment-required accepts list',
+                )
+              : fail(
+                  'payment-required advertises the accepted terms',
+                  'native',
+                  `the payment-required document does not advertise the accepted terms: ` +
+                    `resource url agreement ${urlsAgree}, terms advertised ${advertised}`,
+                ),
+          );
+        }
+      }
+
+      // 9. payment-response matches the settlement observation.
+      if (responseOk && responseDecode.kind === 'decoded') {
+        const response = responseDecode.artifact.decoded as unknown as SettleResponse;
+        const successOk = response.success === (report['settlement_outcome'] === 'succeeded');
+        const transactionOk = response.transaction === report['transaction_hash'];
+        const networkOk = response.network === report['network_reported'];
+        const payerOk =
+          response.payer === undefined ||
+          (typeof response.payer === 'string' &&
+            typeof report['payer_reported'] === 'string' &&
+            sameAddress(response.payer, report['payer_reported'] as string));
+        checks.push(
+          successOk && transactionOk && networkOk && payerOk
+            ? pass(
+                'payment-response matches the settlement observation',
+                'native',
+                'success, transaction, network and payer agree with the settlement observation',
+              )
+            : fail(
+                'payment-response matches the settlement observation',
+                'native',
+                `the native settlement response disagrees with the observation: success ${successOk}, ` +
+                  `transaction ${transactionOk}, network ${networkOk}, payer ${payerOk}`,
+              ),
+        );
+      }
+    } else {
+      for (const [artifact, decode] of [
+        ['artifacts/payment-required.txt', requiredDecode],
+        ['artifacts/payment-signature.txt', signatureDecode],
+        ['artifacts/payment-response.txt', responseDecode],
+      ] as const) {
+        if (decode.kind === 'absent') continue;
+        const stages =
+          decode.kind === 'decoded' ? stageSummary(decode.artifact) : `not decodable (${decode.reason})`;
+        checks.push(
+          pass(
+            `native ${artifact} preserved as presented`,
+            'native',
+            `not held to the expectation: the record's terminal state is ${terminalState}, so the ` +
+              `presented payment is evidence of the attempt, not of a settled payment; stages ${stages}`,
+          ),
+        );
+      }
+    }
+
+    // Always emitted: the request body itself is never part of the evidence directory, so there
+    // is nothing here for a native check to recompute; only the digest the binding recorded of it.
+    checks.push(
+      pass(
+        'request body preimage',
+        'structure',
+        'the request body digest is recorded in the binding; the body is not part of the evidence ' +
+          'directory and is not recomputed',
+      ),
+    );
   }
 
-  return { ok: checks.every((c) => c.ok), checks, warnings };
+  return { ok: checks.every((c) => c.ok), profile: VERIFIER_PROFILE, checks, warnings };
 }
 
 /** A command line this verifier cannot act on. Never raised for evidence that simply fails. */
@@ -1014,10 +1530,23 @@ if (import.meta.url === `file://${process.argv[1]}`) {
  * prints exactly as it did before they existed.
  */
 export function formatReport(directory: string, report: EvidenceVerificationReport): string {
-  const lines = ['', `Evidence verification: ${directory}`, ''];
+  const lines = ['', `Evidence verification: ${directory}`, `  profile: ${report.profile}`, ''];
   for (const check of report.checks) {
-    lines.push(`  ${check.ok ? 'ok  ' : 'FAIL'}  ${check.name}${check.detail ? `: ${check.detail}` : ''}`);
+    lines.push(
+      `  ${check.ok ? 'ok  ' : 'FAIL'}  [${check.category}] ${check.name}` +
+        `${check.detail ? `: ${check.detail}` : ''}`,
+    );
   }
+  lines.push('');
+  lines.push(
+    '  Established by this verifier: signature and digest integrity under the supplied key; document ' +
+      'structure; cross-document consistency; agreement between the captured native x402 artifacts and ' +
+      'the record.',
+  );
+  lines.push(
+    '  Not established: native payment validity (signature recovery, balances, authorization windows); ' +
+      'issuer identity; a fresh chain observation; relying-party acceptance.',
+  );
   for (const warning of report.warnings) {
     lines.push(`  warn  ${warning.name}: ${warning.detail}`);
   }

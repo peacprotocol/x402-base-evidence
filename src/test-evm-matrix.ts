@@ -40,17 +40,20 @@ import { ExactEvmScheme as UpstreamExactEvmFacilitator } from '@x402/evm/exact/f
 import { authorizationTypes, type FacilitatorEvmSigner } from '@x402/evm';
 import { privateKeyToAccount } from 'viem/accounts';
 import { generateKeypair } from '@peac/crypto';
-import { issue } from '@peac/protocol';
+import { issue, computeJsonDocumentDigestJcs } from '@peac/protocol';
+import type { EvidencePillar, JsonValue } from '@peac/kernel';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
 import {
   PAYMENT_IDENTIFIER,
   declarePaymentIdentifierExtension,
+  extractPaymentIdentifier,
 } from '@x402/extensions/payment-identifier';
 import type { PaymentPayload, PaymentRequired } from '@x402/core/types';
 import { beginAcceptanceSuite, recordExecution } from './acceptance-ids.ts';
-import { buildRequestBinding, type PaymentEvidenceRequestBindingV1 } from './binding.ts';
+import { bindingDigest, buildRequestBinding, type PaymentEvidenceRequestBindingV1 } from './binding.ts';
 import { componentsFromAbsoluteUri } from './components.ts';
 import { captureObservedX402Artifact, requireValidX402Artifact } from './x402-header.ts';
+import { coerceDigest, digestBytes } from './digest.ts';
 import * as F from '../fixtures/deterministic.ts';
 import {
   createFixtureFacilitator,
@@ -69,8 +72,11 @@ import {
 } from './flow/fixture-e2e.ts';
 import {
   COMMERCE_GROUP,
+  EXPECTED_EVIDENCE_DIR,
   PAYMENT_EVIDENCE_GROUP,
   RECORD_TYPE,
+  runEvidenceDir,
+  runPublicKeyPath,
   writeEvidence,
   type EvidenceLayout,
 } from './flow/issue-record.ts';
@@ -136,9 +142,11 @@ import {
 } from './flow/preflight.ts';
 import {
   verifyEvidence,
+  VERIFIER_PROFILE,
   type EvidenceVerificationReport,
 } from './flow/verify-evidence.ts';
 import type { EvidenceArtifact } from './flow/presence.ts';
+import { readIssuerPublicKeyFile } from './flow/public-key-file.ts';
 
 beginAcceptanceSuite('evm-matrix');
 
@@ -173,7 +181,10 @@ const paidResult = (): OriginResult => ({
 });
 
 /** Start a paid resource on the loopback interface with the in-process facilitator behind it. */
-async function startOrigin(behavior: FixtureFacilitatorBehavior = {}): Promise<Origin> {
+async function startOrigin(
+  behavior: FixtureFacilitatorBehavior = {},
+  identifierCapacity?: number,
+): Promise<Origin> {
   const facilitator = createFixtureFacilitator(F.NETWORK, behavior);
   const resource = await createPaidResource({
     facilitatorClient: facilitator.client,
@@ -193,6 +204,7 @@ async function startOrigin(behavior: FixtureFacilitatorBehavior = {}): Promise<O
     maxTimeoutSeconds: F.MAX_TIMEOUT_SECONDS,
     declaredExtensions: { [PAYMENT_IDENTIFIER]: declarePaymentIdentifierExtension(true) },
     handler: () => paidResult(),
+    ...(identifierCapacity !== undefined ? { identifierCapacity } : {}),
   });
 
   const server = resource.app.listen(0, '127.0.0.1');
@@ -549,6 +561,66 @@ const failedExactly = (report: EvidenceVerificationReport, names: readonly strin
 const passed = (report: EvidenceVerificationReport, name: string): boolean =>
   report.checks.some((c) => c.name === name && c.ok);
 
+/** The claims a record's payload carries, decoded without verifying the signature over them. */
+interface DecodedRecordClaims {
+  readonly iss: string;
+  readonly type: string;
+  readonly pillars?: EvidencePillar[];
+  readonly occurred_at?: string;
+  readonly extensions: Record<string, Record<string, unknown>>;
+}
+
+/** Decode a compact JWS payload segment without checking its signature. Tamper cases only. */
+function decodeClaims(jws: string): DecodedRecordClaims {
+  const payload = jws.split('.')[1];
+  if (payload === undefined) throw new Error('the record is not a compact serialization');
+  return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as DecodedRecordClaims;
+}
+
+/**
+ * Re-sign the honest evidence with a native artifact and its bound digest edited, and verify it.
+ *
+ * `mutate` receives a copy of the honest layout's files and the honest record's decoded claims. It
+ * edits a native artifact's decoded object, re-encodes it as standard base64 of `JSON.stringify`,
+ * writes the new bytes into `files`, and sets the matching digest inside the payment-evidence
+ * extension so the record it is about to be bound to names the artifact actually being shipped.
+ * The record is then re-issued over the same iss/type/kid/pillars/occurred_at/extensions as the
+ * honest one, with a fresh jti, so the only thing distinguishing this evidence from the honest run
+ * is what the case deliberately changed.
+ */
+async function reissueWith(
+  mutate: (
+    files: Map<EvidenceArtifact, Uint8Array>,
+    claims: DecodedRecordClaims,
+  ) => void | Promise<void>,
+): Promise<EvidenceVerificationReport> {
+  const claims = decodeClaims(honestLayout.jws);
+  const files = new Map(honestLayout.files);
+  await mutate(files, claims);
+  const result = await issue({
+    iss: claims.iss,
+    kind: 'evidence',
+    type: claims.type,
+    privateKey: issuerKey.privateKey,
+    kid: issuerKey.kid,
+    ...(claims.pillars !== undefined ? { pillars: claims.pillars } : {}),
+    ...(claims.occurred_at !== undefined ? { occurred_at: claims.occurred_at } : {}),
+    extensions: claims.extensions,
+  });
+  files.set('record.jws', encoder.encode(`${result.jws}\n`));
+  const directory = mkdtempSync(join(tmpdir(), 'peac-evidence-'));
+  temporaryDirectories.push(directory);
+  writeEvidence(directory, { jws: result.jws, files });
+  return verifyEvidence(directory, issuerKey.publicKey);
+}
+
+/** The evidence extension group's digest fields, so a case can name the one it is refreshing. */
+const paymentEvidence = (claims: DecodedRecordClaims): Record<string, unknown> => {
+  const group = claims.extensions[PAYMENT_EVIDENCE_GROUP];
+  if (group === undefined) throw new Error('the honest record carries no payment-evidence extension');
+  return group;
+};
+
 // Completes EVM-SEC-001: the broadcaster is separately observed and never treated as payment
 // authority. The observation records who broadcast as a fact from the RPC account; the comparison
 // verdicts are computed from the transfer event, so a different broadcaster changes no verdict.
@@ -660,6 +732,7 @@ console.log('\n  -- replay --');
  */
 recordExecution('EVM-REPLAY-001');
 recordExecution('X402-VALID-003');
+recordExecution('EVM-IDEM-001');
 {
   const origin = await startOrigin();
   try {
@@ -697,6 +770,51 @@ recordExecution('X402-VALID-003');
         origin.calls.verify === 1 &&
         origin.observations.length === observationsBeforeReplay,
       `settle calls ${origin.calls.settle}, verify calls ${origin.calls.verify}`,
+    );
+
+    // EVM-IDEM-001 a): an identifier-only payload. Base64 of `{extensions: <same extensions>}` --
+    // no `payload`, so no authorization and no signature at all. It must not be able to read the
+    // cached result on the strength of the identifier alone: presentedAuthorization() returns
+    // undefined for it, so this layer leaves the map untouched and passes it through to the
+    // payment middleware, which refuses it on its own terms.
+    const probeExtensions = (payment as { extensions?: unknown }).extensions;
+    const probeHeader = Buffer.from(JSON.stringify({ extensions: probeExtensions })).toString(
+      'base64',
+    );
+    const probe = await fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: { 'payment-signature': probeHeader },
+    });
+    const probeBytes = new Uint8Array(await probe.arrayBuffer());
+    check(
+      'an identifier-only probe with no authorization is not served the cached result',
+      probe.status !== 200 &&
+        Buffer.compare(Buffer.from(probeBytes), Buffer.from(replayedBytes)) !== 0,
+      `status ${probe.status}`,
+    );
+    check(
+      'the identifier-only probe reaches no settlement; the honest settlement stays the only one',
+      origin.calls.settle === 1 && origin.calls.verify === 1,
+      `settle calls ${origin.calls.settle}, verify calls ${origin.calls.verify}`,
+    );
+
+    // EVM-IDEM-001 b): same identifier, same fingerprint, a DIFFERENT authorization (changed
+    // nonce). The cached result is bound to the authorization that was actually settled, not to
+    // the identifier alone, so this is refused rather than served.
+    const differentAuthorization: PaymentPayload = structuredClone(payment);
+    (differentAuthorization.payload as { authorization: { nonce: string } }).authorization.nonce =
+      `0x${'9d'.repeat(32)}`;
+    const differentAuthResponse = await fetch(
+      `${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`,
+      { method: 'GET', headers: http.encodePaymentSignatureHeader(differentAuthorization) },
+    );
+    const differentAuthBytes = new Uint8Array(await differentAuthResponse.arrayBuffer());
+    check(
+      'the same identifier presenting a different authorization is refused, not served the cached result',
+      differentAuthResponse.status === 409 &&
+        Buffer.compare(Buffer.from(differentAuthBytes), Buffer.from(replayedBytes)) !== 0 &&
+        origin.calls.settle === 1,
+      `status ${differentAuthResponse.status}, settle calls ${origin.calls.settle}`,
     );
 
     // The same consumed authorization under a DIFFERENT payment identifier: an independent
@@ -809,6 +927,322 @@ recordExecution('X402-VALID-003');
       'distinct payment identifiers over distinct authorizations settle independently',
       a.status === 200 && b.status === 200 && origin.calls.settle === 2,
       `a ${a.status}, b ${b.status}, settle calls ${origin.calls.settle}`,
+    );
+  } finally {
+    await origin.close();
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// EVM-IDEM-002: overlapping requests under one payment identifier share one operation.
+// ---------------------------------------------------------------------------------------------
+
+recordExecution('EVM-IDEM-002');
+{
+  let releaseBarrier: (() => void) | undefined;
+  const barrierProceed = new Promise<void>((resolve) => {
+    releaseBarrier = resolve;
+  });
+  let arrivedResolve: (() => void) | undefined;
+  const arrived = new Promise<void>((resolve) => {
+    arrivedResolve = resolve;
+  });
+  const origin = await startOrigin({
+    settlementBarrier: { arrived: () => arrivedResolve?.(), proceed: barrierProceed },
+  });
+  try {
+    const http = upstreamClient();
+    const { paymentRequired } = await challenge(origin, http);
+    const payment = await http.createPaymentPayload(paymentRequired);
+
+    // Request A reaches settlement and is held at the barrier.
+    const aPromise = fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: http.encodePaymentSignatureHeader(payment),
+    });
+    await arrived;
+
+    // Request B: the identical header. It must wait on A's pending operation rather than start
+    // its own verification and settlement.
+    const bPromise = fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: http.encodePaymentSignatureHeader(payment),
+    });
+
+    // Request C: same identifier, same fingerprint, a DIFFERENT authorization. It must not wait
+    // on A — it is refused immediately as bound to a different authorization, so it is awaited
+    // in full before the barrier is released.
+    const conflicting: PaymentPayload = structuredClone(payment);
+    (conflicting.payload as { authorization: { nonce: string } }).authorization.nonce =
+      `0x${'c3'.repeat(32)}`;
+    const c = await fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: http.encodePaymentSignatureHeader(conflicting),
+    });
+    await c.arrayBuffer();
+    check(
+      'a differently-authorized request under the identifier in flight is refused immediately, without waiting on it',
+      c.status === 409,
+      `status ${c.status}`,
+    );
+
+    const observationsBeforeRelease = origin.observations.length;
+    releaseBarrier?.();
+    const [a, b] = await Promise.all([aPromise, bPromise]);
+    const aBytes = new Uint8Array(await a.arrayBuffer());
+    const bBytes = new Uint8Array(await b.arrayBuffer());
+    check(
+      'both the settling request and the one that waited on it observe the identical settled result',
+      a.status === 200 &&
+        b.status === 200 &&
+        Buffer.compare(Buffer.from(aBytes), Buffer.from(bBytes)) === 0 &&
+        a.headers.get('payment-response') !== null &&
+        a.headers.get('payment-response') === b.headers.get('payment-response'),
+      `a ${a.status}, b ${b.status}`,
+    );
+    check(
+      'overlapping requests under one identifier share exactly one verification and one settlement',
+      origin.calls.verify === 1 && origin.calls.settle === 1,
+      `verify calls ${origin.calls.verify}, settle calls ${origin.calls.settle}`,
+    );
+    check(
+      'the shared operation adds exactly one lifecycle observation for the paid path',
+      origin.observations.length === observationsBeforeRelease + 1,
+      `observations grew by ${origin.observations.length - observationsBeforeRelease}`,
+    );
+  } finally {
+    await origin.close();
+  }
+}
+
+// Distinct identifiers over distinct authorizations, held at the same barrier, settle
+// independently rather than serializing on each other — the barrier synchronizes this test, it
+// does not create cross-identifier contention. Reuses the sequential distinct-identifiers case
+// above for the non-concurrent half of this property.
+{
+  let releaseBarrier: (() => void) | undefined;
+  const barrierProceed = new Promise<void>((resolve) => {
+    releaseBarrier = resolve;
+  });
+  let arrivals = 0;
+  let bothArrivedResolve: (() => void) | undefined;
+  const bothArrived = new Promise<void>((resolve) => {
+    bothArrivedResolve = resolve;
+  });
+  const origin = await startOrigin({
+    settlementBarrier: {
+      arrived: () => {
+        arrivals++;
+        if (arrivals === 2) bothArrivedResolve?.();
+      },
+      proceed: barrierProceed,
+    },
+  });
+  try {
+    const http = upstreamClient();
+    const { paymentRequired } = await challenge(origin, http);
+    const base = await http.createPaymentPayload(paymentRequired);
+    const withFreshMaterial = (id: string, nonce: string): PaymentPayload => {
+      const cloned: PaymentPayload = structuredClone(base);
+      (cloned.payload as { authorization: { nonce: string } }).authorization.nonce = nonce;
+      (cloned.extensions as Record<string, { info: { id?: string } }>)[
+        'payment-identifier'
+      ]!.info.id = id;
+      return cloned;
+    };
+    const aPromise = fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: http.encodePaymentSignatureHeader(
+        withFreshMaterial('pay_barrier00000000000000a', `0x${'d4'.repeat(32)}`),
+      ),
+    });
+    const bPromise = fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: http.encodePaymentSignatureHeader(
+        withFreshMaterial('pay_barrier00000000000000b', `0x${'d5'.repeat(32)}`),
+      ),
+    });
+    await bothArrived;
+    releaseBarrier?.();
+    const [a, b] = await Promise.all([aPromise, bPromise]);
+    await Promise.all([a.arrayBuffer(), b.arrayBuffer()]);
+    check(
+      'distinct identifiers held at the same barrier settle independently, not serialized on each other',
+      a.status === 200 && b.status === 200 && origin.calls.settle === 2,
+      `a ${a.status}, b ${b.status}, settle calls ${origin.calls.settle}`,
+    );
+  } finally {
+    await origin.close();
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// EVM-IDEM-003: a rejected attempt releases the identifier; an uncertain outcome never does.
+// ---------------------------------------------------------------------------------------------
+
+recordExecution('EVM-IDEM-003');
+
+// a) concurrent variant of the sequential rejectSettlement case above: B is sent while A's
+// refused settlement is held at the barrier, and is processed — settling a second time — only
+// once A has concluded as rejected and released the identifier.
+{
+  let releaseBarrier: (() => void) | undefined;
+  const barrierProceed = new Promise<void>((resolve) => {
+    releaseBarrier = resolve;
+  });
+  let arrivedResolve: (() => void) | undefined;
+  const arrived = new Promise<void>((resolve) => {
+    arrivedResolve = resolve;
+  });
+  const origin = await startOrigin({
+    rejectSettlement: 'synthetic_settlement_refusal',
+    settlementBarrier: { arrived: () => arrivedResolve?.(), proceed: barrierProceed },
+  });
+  try {
+    const http = upstreamClient();
+    const { paymentRequired } = await challenge(origin, http);
+    const payment = await http.createPaymentPayload(paymentRequired);
+    const aPromise = fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: http.encodePaymentSignatureHeader(payment),
+    });
+    await arrived;
+    const bPromise = fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: http.encodePaymentSignatureHeader(payment),
+    });
+    releaseBarrier?.();
+    const [a, b] = await Promise.all([aPromise, bPromise]);
+    await Promise.all([a.arrayBuffer(), b.arrayBuffer()]);
+    check(
+      'a request that waited through a refused settlement is processed once it releases the identifier',
+      a.status === 402 && b.status === 402 && origin.calls.settle === 2,
+      `a ${a.status}, b ${b.status}, settle calls ${origin.calls.settle}`,
+    );
+  } finally {
+    await origin.close();
+  }
+}
+
+// b) settlement that raises rather than answers is uncertain, and an uncertain identifier
+// refuses every further attempt, regardless of authorization, for the rest of the run.
+{
+  const origin = await startOrigin({ throwOnSettle: 'synthetic settlement exception' });
+  try {
+    const http = upstreamClient();
+    const { paymentRequired } = await challenge(origin, http);
+    const payment = await http.createPaymentPayload(paymentRequired);
+    const first = await present(origin, http, payment);
+    check(
+      'a settlement that raises is recorded honestly as settlement_failed/settlement_exception',
+      first.observation.lifecycle.terminalState === 'settlement_failed' &&
+        first.observation.lifecycle.failureReason === 'settlement_exception',
+      `${first.observation.lifecycle.terminalState}, ${String(first.observation.lifecycle.failureReason)}`,
+    );
+    const retrySameAuth = await fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: http.encodePaymentSignatureHeader(payment),
+    });
+    const retryBody: unknown = await retrySameAuth.json().catch(() => undefined);
+    check(
+      'a retry under an uncertain identifier is refused with the unknown-outcome message',
+      retrySameAuth.status === 409 &&
+        typeof retryBody === 'object' &&
+        retryBody !== null &&
+        (retryBody as { error?: string }).error ===
+          'the outcome of an earlier attempt under this payment identifier is unknown; it cannot be retried in this process',
+      `status ${retrySameAuth.status}, body ${JSON.stringify(retryBody)}`,
+    );
+    const differentAuth: PaymentPayload = structuredClone(payment);
+    (differentAuth.payload as { authorization: { nonce: string } }).authorization.nonce =
+      `0x${'e1'.repeat(32)}`;
+    const retryDifferentAuth = await fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: http.encodePaymentSignatureHeader(differentAuth),
+    });
+    await retryDifferentAuth.arrayBuffer();
+    check(
+      'an uncertain identifier refuses even a differently-authorized attempt; nothing settles again',
+      retryDifferentAuth.status === 409 && origin.calls.settle === 1,
+      `status ${retryDifferentAuth.status}, settle calls ${origin.calls.settle}`,
+    );
+  } finally {
+    await origin.close();
+  }
+}
+
+// c) verification refused before settlement is reached at all: a retry-safe rejection, so a
+// corrected attempt under the same identifier is released back to verification.
+{
+  const origin = await startOrigin({ rejectVerification: 'synthetic_verification_refusal' });
+  try {
+    const http = upstreamClient();
+    const { paymentRequired } = await challenge(origin, http);
+    const payment = await http.createPaymentPayload(paymentRequired);
+    const first = await present(origin, http, payment);
+    check(
+      'verification refused ends in verification_rejected with no settlement attempted',
+      first.observation.lifecycle.terminalState === 'verification_rejected',
+      first.observation.lifecycle.terminalState,
+    );
+    const corrected: PaymentPayload = structuredClone(payment);
+    (corrected.payload as { authorization: { nonce: string } }).authorization.nonce =
+      `0x${'f2'.repeat(32)}`;
+    await present(origin, http, corrected);
+    check(
+      'a rejected verification releases the identifier: a corrected attempt reaches verification again',
+      origin.calls.verify === 2,
+      `verify calls ${origin.calls.verify}`,
+    );
+  } finally {
+    await origin.close();
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// EVM-IDEM-004: the identifier store refuses new identifiers at capacity and never evicts.
+// ---------------------------------------------------------------------------------------------
+
+recordExecution('EVM-IDEM-004');
+{
+  const origin = await startOrigin({}, 1);
+  try {
+    const http = upstreamClient('pay_capacity0000000000001a');
+    const { paymentRequired } = await challenge(origin, http);
+    const first = await http.createPaymentPayload(paymentRequired);
+    const firstResponse = await present(origin, http, first);
+    check(
+      'the first identifier is admitted under a capacity of one',
+      firstResponse.status === 200,
+      `status ${firstResponse.status}`,
+    );
+
+    const secondHttp = upstreamClient('pay_capacity0000000000002b');
+    const secondPayment = await secondHttp.createPaymentPayload(paymentRequired);
+    const second = await fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: secondHttp.encodePaymentSignatureHeader(secondPayment),
+    });
+    const secondBody: unknown = await second.json().catch(() => undefined);
+    check(
+      'a new identifier is refused at capacity, before verification, and nothing is evicted',
+      second.status === 503 &&
+        typeof secondBody === 'object' &&
+        secondBody !== null &&
+        (secondBody as { error?: string }).error === 'payment identifier store at capacity' &&
+        origin.calls.verify === 1,
+      `status ${second.status}, verify calls ${origin.calls.verify}`,
+    );
+
+    const retryFirst = await fetch(`${origin.baseUrl}${RESOURCE_PATH}${RESOURCE_QUERY}`, {
+      method: 'GET',
+      headers: http.encodePaymentSignatureHeader(first),
+    });
+    const retryFirstBytes = new Uint8Array(await retryFirst.arrayBuffer());
+    check(
+      'a retry of the already-admitted identifier is still served after the store is at capacity',
+      retryFirst.status === 200 && retryFirstBytes.length > 0,
+      `status ${retryFirst.status}`,
     );
   } finally {
     await origin.close();
@@ -2872,7 +3306,12 @@ recordExecution('EVM-BIND-001');
   );
   check(
     'a payment bound to one resource fails when presented for another',
-    failedExactly(report, ['request binding digest']),
+    // The substituted binding also names a resource the native payment-signature does not, so the
+    // native cross-check between the two fails alongside the binding digest itself.
+    failedExactly(report, [
+      'request binding digest',
+      'payment-signature resource matches the request binding',
+    ]),
     failedChecks(report).join(', ') || 'nothing failed',
   );
   check(
@@ -2888,7 +3327,12 @@ recordExecution('EVM-BIND-002');
   );
   check(
     'the same path with a changed query fails request binding',
-    failedExactly(report, ['request binding digest']),
+    // Same cascade as EVM-BIND-001: the binding now names a different query, which the native
+    // resource-agreement check also catches.
+    failedExactly(report, [
+      'request binding digest',
+      'payment-signature resource matches the request binding',
+    ]),
     failedChecks(report).join(', ') || 'nothing failed',
   );
 }
@@ -2961,6 +3405,222 @@ recordExecution('EVM-BIND-004');
 }
 
 // ---------------------------------------------------------------------------------------------
+// Native: the captured x402 artifacts, decoded and compared against the record and observation.
+// ---------------------------------------------------------------------------------------------
+
+console.log('\n  -- native --');
+
+recordExecution('EVM-NATIVE-001');
+{
+  // A signed producer inconsistency: a re-signed native payment-signature whose accepted amount and
+  // authorization value both disagree with the record and the observation, while the digest that
+  // binds the artifact is refreshed to match, so nothing upstream of the native checks can catch
+  // it. This also breaks what the payment-required document advertised, because the accepted
+  // terms it must contain no longer match: a producer that shipped this would fail three named
+  // checks, not the two the terms/authorization comparison alone would suggest, and the honest
+  // count is asserted rather than assumed.
+  const report = await reissueWith((files, claims) => {
+    const original = decoder.decode(files.get('artifacts/payment-signature.txt'));
+    const decoded = JSON.parse(Buffer.from(original, 'base64').toString('utf8')) as {
+      accepted: { amount: unknown };
+      payload: { authorization: { value: unknown } };
+    };
+    decoded.accepted.amount = '999999';
+    decoded.payload.authorization.value = '999999';
+    const newBytes = encoder.encode(Buffer.from(JSON.stringify(decoded)).toString('base64'));
+    files.set('artifacts/payment-signature.txt', newBytes);
+    paymentEvidence(claims)['payment_signature_digest'] = digestBytes(newBytes);
+  });
+  check(
+    'a re-signed native payment-signature whose amount disagrees with the record fails the named terms and authorization checks',
+    failedExactly(report, [
+      'payment-signature terms match the expectation',
+      'payment-signature authorization matches the expectation',
+      'payment-required advertises the accepted terms',
+    ]) && passed(report, 'payment-signature digest'),
+    failedChecks(report).join(', ') || 'nothing failed',
+  );
+}
+
+recordExecution('EVM-NATIVE-002');
+{
+  const report = await reissueWith((files, claims) => {
+    const original = decoder.decode(files.get('artifacts/payment-response.txt'));
+    const decoded = JSON.parse(Buffer.from(original, 'base64').toString('utf8')) as {
+      transaction: unknown;
+    };
+    decoded.transaction = `0x${'ab'.repeat(32)}`;
+    const newBytes = encoder.encode(Buffer.from(JSON.stringify(decoded)).toString('base64'));
+    files.set('artifacts/payment-response.txt', newBytes);
+    paymentEvidence(claims)['payment_response_digest'] = digestBytes(newBytes);
+  });
+  check(
+    'a re-signed native payment-response whose transaction disagrees with the observation fails the named settlement check',
+    // The observation document still names the honest response digest, so the two documents
+    // disagree about what settled as well as disagreeing about the transaction itself: both are
+    // legitimate consequences of the one edit, and the record's own digest recomputes intact.
+    failedExactly(report, [
+      'payment-response matches the settlement observation',
+      'record and observation name the same settlement response digest',
+    ]) && passed(report, 'payment-response digest'),
+    failedChecks(report).join(', ') || 'nothing failed',
+  );
+}
+
+recordExecution('EVM-NATIVE-003');
+{
+  const report = await reissueWith((files, claims) => {
+    const original = decoder.decode(files.get('artifacts/payment-signature.txt'));
+    const decoded = JSON.parse(Buffer.from(original, 'base64').toString('utf8')) as {
+      resource: { url: unknown };
+    };
+    decoded.resource = {
+      ...decoded.resource,
+      url: 'https://api.example.test/v1/other?region=zzz&units=metric',
+    };
+    const newBytes = encoder.encode(Buffer.from(JSON.stringify(decoded)).toString('base64'));
+    files.set('artifacts/payment-signature.txt', newBytes);
+    paymentEvidence(claims)['payment_signature_digest'] = digestBytes(newBytes);
+  });
+  check(
+    'a re-signed native payment-signature naming a different resource fails the request-binding agreement check',
+    // Also breaks the payment-required cross-check, since it compares the resource url on both
+    // native artifacts and the two no longer agree.
+    failedExactly(report, [
+      'payment-signature resource matches the request binding',
+      'payment-required advertises the accepted terms',
+    ]) && passed(report, 'payment-signature digest'),
+    failedChecks(report).join(', ') || 'nothing failed',
+  );
+}
+
+recordExecution('EVM-NATIVE-004');
+{
+  const report = await reissueWith((files, claims) => {
+    const original = decoder.decode(files.get('artifacts/payment-signature.txt'));
+    const decoded = JSON.parse(Buffer.from(original, 'base64').toString('utf8')) as {
+      extensions: { 'payment-identifier': { info: { id: unknown } } };
+    };
+    decoded.extensions['payment-identifier'].info.id = 'pay_0000000000000000000000000000f1x3';
+    const newBytes = encoder.encode(Buffer.from(JSON.stringify(decoded)).toString('base64'));
+    files.set('artifacts/payment-signature.txt', newBytes);
+    paymentEvidence(claims)['payment_signature_digest'] = digestBytes(newBytes);
+  });
+  check(
+    'a payment identifier that disagrees with the record reference fails by name',
+    failedExactly(report, ['payment-signature identifier matches the record reference']),
+    failedChecks(report).join(', ') || 'nothing failed',
+  );
+}
+
+recordExecution('EVM-NATIVE-005');
+{
+  // Not held: verification was refused before the handler ran, so no settlement was ever
+  // expected. A malformed presented payment is still evidence of the attempt, and the preserved
+  // rule reports it as such rather than measuring it against an expectation it never had.
+  const rejectedRun = await runOnce({
+    facilitator: { rejectVerification: 'synthetic_verification_refusal' },
+  });
+  const rejectedLayout = await buildEvidence(rejectedRun);
+  const claims = decodeClaims(rejectedLayout.jws);
+  const files = new Map(rejectedLayout.files);
+
+  const malformedValue = Buffer.from(JSON.stringify({ x402Version: 2 })).toString('base64');
+  const malformedBytes = encoder.encode(malformedValue);
+  files.set('artifacts/payment-signature.txt', malformedBytes);
+  const signatureDigest = digestBytes(malformedBytes);
+  paymentEvidence(claims)['payment_signature_digest'] = signatureDigest;
+
+  const originalBinding = JSON.parse(
+    decoder.decode(files.get('request-binding.json')),
+  ) as PaymentEvidenceRequestBindingV1;
+  const refreshedBinding = buildRequestBinding({
+    components: originalBinding.components,
+    body: F.REQUEST_BODY,
+    selectedHeaders: [{ name: 'payment-signature', observedValueDigest: signatureDigest }],
+  });
+  files.set('request-binding.json', documentBytes(refreshedBinding));
+  paymentEvidence(claims)['request_binding_digest'] = await bindingDigest(refreshedBinding);
+
+  const result = await issue({
+    iss: claims.iss,
+    kind: 'evidence',
+    type: claims.type,
+    privateKey: issuerKey.privateKey,
+    kid: issuerKey.kid,
+    ...(claims.pillars !== undefined ? { pillars: claims.pillars } : {}),
+    ...(claims.occurred_at !== undefined ? { occurred_at: claims.occurred_at } : {}),
+    extensions: claims.extensions,
+  });
+  files.set('record.jws', encoder.encode(`${result.jws}\n`));
+  const directory = mkdtempSync(join(tmpdir(), 'peac-evidence-'));
+  temporaryDirectories.push(directory);
+  writeEvidence(directory, { jws: result.jws, files });
+  const report = await verifyEvidence(directory, issuerKey.publicKey);
+  check(
+    'evidence of a rejected payment attempt with a malformed native artifact stays verifiable under the preserved rule',
+    report.ok && passed(report, 'native artifacts/payment-signature.txt preserved as presented'),
+    failedChecks(report).join(', ') || 'nothing failed',
+  );
+}
+
+recordExecution('EVM-NATIVE-006');
+{
+  const report = await reissueWith(async (files, claims) => {
+    const observation = JSON.parse(decoder.decode(files.get('chain-observation.json'))) as Record<
+      string,
+      unknown
+    >;
+    const tampered = { ...observation, unexpected_member: 'x' };
+    files.set('chain-observation.json', documentBytes(tampered));
+    paymentEvidence(claims)['chain_observation_digest'] = coerceDigest(
+      await computeJsonDocumentDigestJcs(tampered as JsonValue),
+    );
+  });
+  check(
+    'the chain observation document is held to its closed schema; an unknown member fails by name',
+    failedExactly(report, ['chain observation local profile schema']) &&
+      report.checks.some(
+        (c) => c.name === 'chain observation local profile schema' && c.detail.includes('unexpected_member'),
+      ),
+    failedChecks(report).join(', ') || 'nothing failed',
+  );
+}
+
+recordExecution('EVM-NATIVE-007');
+{
+  const fixtureKey = await resolveIssuerKey('fixture');
+  const fixtureReport = await verifyEvidence(EXPECTED_EVIDENCE_DIR, fixtureKey.publicKey);
+  const fixtureNativeChecks = fixtureReport.checks.filter((c) => c.category === 'native');
+  check(
+    'the committed fixture evidence verifies under profile 2 with every native check passing',
+    fixtureReport.ok &&
+      fixtureReport.profile === VERIFIER_PROFILE &&
+      fixtureNativeChecks.length > 0 &&
+      fixtureNativeChecks.every((c) => c.ok),
+    failedChecks(fixtureReport).join(', ') || 'nothing failed',
+  );
+
+  const liveDir = 'out/live-20260828T214534z';
+  const liveKeyFile = 'out/live-20260828T214534z-issuer.pub.json';
+  if (!existsSync(liveDir) || !existsSync(liveKeyFile)) {
+    console.log('    (skipping the archived live-evidence half: the directory is absent here)');
+  } else {
+    const liveKey = readIssuerPublicKeyFile(liveKeyFile);
+    const liveReport = await verifyEvidence(liveDir, liveKey.publicKey);
+    const liveNativeChecks = liveReport.checks.filter((c) => c.category === 'native');
+    check(
+      'the archived live evidence verifies under profile 2 with every native check passing',
+      liveReport.ok &&
+        liveReport.profile === VERIFIER_PROFILE &&
+        liveNativeChecks.length > 0 &&
+        liveNativeChecks.every((c) => c.ok),
+      failedChecks(liveReport).join(', ') || 'nothing failed',
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Tamper: one edit, one named failure.
 // ---------------------------------------------------------------------------------------------
 
@@ -2991,8 +3651,11 @@ recordExecution('EVM-TAMPER-002');
   const tampered = encoder.encode(`${observed.slice(0, -4)}AAAA`);
   const report = await verifyWith(new Map([['artifacts/payment-signature.txt', tampered]]));
   check(
-    'a tampered observed field value fails its own digest and nothing else',
-    failedExactly(report, ['payment-signature digest']),
+    'a tampered observed field value fails its own digest and, since the tamper also breaks the base64 it decodes from, the native decode check',
+    // Replacing the last four characters with 'AAAA' corrupts the base64/JSON the artifact decodes
+    // to, so this edit legitimately trips the native decode check as well as the digest: not a
+    // cascade from a shared cause, but two separate, correct verdicts about the same bad bytes.
+    failedExactly(report, ['payment-signature digest', 'native payment-signature decodes']),
     failedChecks(report).join(', ') || 'nothing failed',
   );
   check(
@@ -3070,11 +3733,17 @@ recordExecution('EVM-TAMPER-004');
   });
   const report = await verifyWith(new Map([['chain-observation.json', tampered]]));
   check(
-    'an altered observation document fails its own digest and the amount the record repeats, not the native artifact',
+    'an altered observation document fails its own digest and the amount the record repeats, and, since the native payment-signature still names the honest amount, the two native checks that compare it against the now-tampered expectation',
+    // The native artifact itself is untouched: `payment-signature digest` still recomputes. But
+    // the expectation these native checks compare it against now says '1', so the native terms and
+    // authorization checks legitimately disagree with it too -- correctly attributing the defect to
+    // the observation document, never to the native artifact.
     failedExactly(report, [
       'chain observation digest',
       'record and observation name the same amount',
-    ]) && passed(report, 'payment-response digest'),
+      'payment-signature terms match the expectation',
+      'payment-signature authorization matches the expectation',
+    ]) && passed(report, 'payment-response digest') && passed(report, 'payment-signature digest'),
     failedChecks(report).join(', ') || 'nothing failed',
   );
 }
