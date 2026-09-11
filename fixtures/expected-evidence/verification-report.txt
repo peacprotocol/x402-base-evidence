@@ -1,28 +1,43 @@
 Evidence verification: fixtures/expected-evidence
+  profile: x402-base-evidence/offline-verification/2
 
-  ok    record signature and schema: verified under kid base-payment-evidence-fixture-key-1
-  ok    record type: org.peacprotocol/payment
-  ok    extension groups: org.peacprotocol/commerce, com.example/payment_evidence
-  ok    request binding digest: sha256:cdaf3bfc725a1e66fb583ed6ebc7853aee9330633ca7522d45783756f7ba1843
-  ok    request binding local profile: matches the example-local schema
-  ok    origin result binding digest: sha256:ea22f378381de6decceb275b26126380c04475b92f95d92bca6616a048b6a59c
-  ok    origin result binding local profile: matches the example-local schema
-  ok    chain observation digest: sha256:b4cdeb7788c19b097ab665ea80f89adea35d011f1689cc296eee6ac661e28214
-  ok    payment-required digest: sha256:86b5943e8265096a37c765b2dfa475192b840a63aeee31e048d0df0d62540ca0
-  ok    payment-signature digest: sha256:5f4b92dd1fada6010447099c3f3d3b6d8ed092bc2f3aa6db95d47d7bc22975e5
-  ok    payment-response digest: sha256:bf0b4a490ecb29aa8ba3f924ccb7cb12a6682bac4b346264f7e540310d4fc755
-  ok    origin result body: sha256:5f564269ae83a2ab0cde2d8de9fed2921ffa95e67aa7fa6035884c93bce3087c
-  ok    artifact presence contract: consistent with response_write_attempted
-  ok    chain observation local profile: org.peacprotocol.examples.payment-evidence/base-chain-observation/1
-  ok    chain observation scheme: exact
-  ok    expectation and observation are separately attributed: payment_expectation and chain_observation both present with their sources
-  ok    settlement facts match the outcome: settled, transaction recorded
-  ok    expectation comparison: network=match asset=not_evaluated recipient=not_evaluated amount=not_evaluated authorization=linked transfer_event=not_evaluated
-  ok    record and observation name the same network: eip155:84532
-  ok    record and observation name the same terminal state: response_write_attempted
-  ok    record and observation name the same asset: 0x036CbD53842c5426634e7929541eC2318f3dCF7e
-  ok    record and observation name the same amount: 250000
-  ok    record and observation name the same settlement response digest: sha256:bf0b4a490ecb29aa8ba3f924ccb7cb12a6682bac4b346264f7e540310d4fc755
-  ok    result binding and observation name the same origin result digest: sha256:5f564269ae83a2ab0cde2d8de9fed2921ffa95e67aa7fa6035884c93bce3087c
+  ok    [integrity] record signature and schema: verified under kid base-payment-evidence-fixture-key-1
+  ok    [structure] record type: org.peacprotocol/payment
+  ok    [structure] extension groups: org.peacprotocol/commerce, com.example/payment_evidence
+  ok    [integrity] request binding digest: sha256:cdaf3bfc725a1e66fb583ed6ebc7853aee9330633ca7522d45783756f7ba1843
+  ok    [structure] request binding local profile: matches the example-local schema
+  ok    [integrity] origin result binding digest: sha256:ea22f378381de6decceb275b26126380c04475b92f95d92bca6616a048b6a59c
+  ok    [structure] origin result binding local profile: matches the example-local schema
+  ok    [integrity] chain observation digest: sha256:b4cdeb7788c19b097ab665ea80f89adea35d011f1689cc296eee6ac661e28214
+  ok    [structure] chain observation local profile schema: matches the example-local schema
+  ok    [integrity] payment-required digest: sha256:86b5943e8265096a37c765b2dfa475192b840a63aeee31e048d0df0d62540ca0
+  ok    [integrity] payment-signature digest: sha256:5f4b92dd1fada6010447099c3f3d3b6d8ed092bc2f3aa6db95d47d7bc22975e5
+  ok    [integrity] payment-response digest: sha256:bf0b4a490ecb29aa8ba3f924ccb7cb12a6682bac4b346264f7e540310d4fc755
+  ok    [integrity] origin result body: sha256:5f564269ae83a2ab0cde2d8de9fed2921ffa95e67aa7fa6035884c93bce3087c
+  ok    [structure] artifact presence contract: consistent with response_write_attempted
+  ok    [structure] chain observation local profile: org.peacprotocol.examples.payment-evidence/base-chain-observation/1
+  ok    [structure] chain observation scheme: exact
+  ok    [structure] expectation and observation are separately attributed: payment_expectation and chain_observation both present with their sources
+  ok    [structure] settlement facts match the outcome: settled, transaction recorded
+  ok    [consistency] expectation comparison: network=match asset=not_evaluated recipient=not_evaluated amount=not_evaluated authorization=linked transfer_event=not_evaluated
+  ok    [consistency] record and observation name the same network: eip155:84532
+  ok    [consistency] record and observation name the same terminal state: response_write_attempted
+  ok    [consistency] record and observation name the same asset: 0x036CbD53842c5426634e7929541eC2318f3dCF7e
+  ok    [consistency] record and observation name the same amount: 250000
+  ok    [consistency] record and observation name the same settlement response digest: sha256:bf0b4a490ecb29aa8ba3f924ccb7cb12a6682bac4b346264f7e540310d4fc755
+  ok    [consistency] result binding and observation name the same origin result digest: sha256:5f564269ae83a2ab0cde2d8de9fed2921ffa95e67aa7fa6035884c93bce3087c
+  ok    [native] native payment-required decodes: transport=accepted json=accepted duplicate-members=accepted upstream-schema=accepted scheme-payload=not_evaluated extensions=not_evaluated
+  ok    [native] native payment-signature decodes: transport=accepted json=accepted duplicate-members=accepted upstream-schema=accepted scheme-payload=accepted extensions=accepted
+  ok    [native] native payment-response decodes: transport=accepted json=accepted duplicate-members=accepted upstream-schema=not_evaluated scheme-payload=not_evaluated extensions=not_evaluated
+  ok    [native] payment-signature terms match the expectation: scheme, network, asset, amount and recipient agree with the expectation
+  ok    [native] payment-signature authorization matches the expectation: from, to, value and the authorization digest agree with the expectation
+  ok    [native] payment-signature identifier matches the record reference: pay_0000000000000000000000000000f1x2
+  ok    [native] payment-signature resource matches the request binding: scheme, authority, path and query agree
+  ok    [native] payment-required advertises the accepted terms: the resource url and the accepted terms both appear in the payment-required accepts list
+  ok    [native] payment-response matches the settlement observation: success, transaction, network and payer agree with the settlement observation
+  ok    [structure] request body preimage: the request body digest is recorded in the binding; the body is not part of the evidence directory and is not recomputed
+
+  Established by this verifier: signature and digest integrity under the supplied key; document structure; cross-document consistency; agreement between the captured native x402 artifacts and the record.
+  Not established: native payment validity (signature recovery, balances, authorization windows); issuer identity; a fresh chain observation; relying-party acceptance.
 
 Verified. Contents are intact relative to the supplied key, every bound digest recomputes, and the checked cross-document fields are internally consistent.

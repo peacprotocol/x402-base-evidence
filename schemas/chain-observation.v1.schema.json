@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://peacprotocol.org/examples/payment-evidence/chain-observation/1",
+  "$comment": "$id is a namespace identifier, not a retrieval promise: this URL is not guaranteed to be dereferenceable.",
+  "title": "Payment-evidence example chain observation (non-normative)",
+  "description": "Application-local profile for this example. Does not extend the PEAC wire format, record registry, extension registry or conformance requirements. Derived from BaseChainObservationV1 in src/flow/observe-settlement.ts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "profile",
+    "scheme",
+    "payment_expectation",
+    "chain_observation",
+    "comparison",
+    "terminal_state",
+    "observed_at_unix_seconds"
+  ],
+  "properties": {
+    "profile": { "const": "org.peacprotocol.examples.payment-evidence/base-chain-observation/1" },
+    "scheme": { "type": "string", "minLength": 1 },
+    "payment_expectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "network", "asset", "amount_base_units", "asset_decimals", "recipient"],
+      "properties": {
+        "source": { "const": "native_x402_artifact" },
+        "network": { "type": "string", "minLength": 1 },
+        "asset": { "type": "string", "minLength": 1 },
+        "amount_base_units": { "type": "string", "minLength": 1 },
+        "asset_decimals": { "type": "integer", "minimum": 0 },
+        "recipient": { "type": "string", "minLength": 1 },
+        "payer": { "type": "string", "minLength": 1 },
+        "authorization_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "chain_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "settlement_outcome", "observed_at_unix_seconds"],
+      "properties": {
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reference"],
+          "properties": {
+            "kind": { "enum": ["facilitator", "in_process_fixture"] },
+            "reference": { "type": "string", "minLength": 1 }
+          }
+        },
+        "settlement_outcome": { "enum": ["succeeded", "refused", "not_reached"] },
+        "transaction_hash": { "type": "string", "minLength": 1 },
+        "network_reported": { "type": "string", "minLength": 1 },
+        "payer_reported": { "type": "string", "minLength": 1 },
+        "observed_at_unix_seconds": { "type": "integer" }
+      }
+    },
+    "rpc_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "transaction_hash", "observation_state", "observed_at_unix_seconds", "statement"],
+      "properties": {
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "reference"],
+          "properties": {
+            "kind": { "const": "rpc" },
+            "reference": { "type": "string", "minLength": 1 }
+          }
+        },
+        "transaction_hash": { "type": "string", "minLength": 1 },
+        "observation_state": { "enum": ["found", "not_found", "unavailable"] },
+        "observation_level": { "const": "l2_block_inclusion" },
+        "receipt_status": { "enum": ["success", "reverted"] },
+        "transaction_sender": { "type": "string", "minLength": 1 },
+        "block_number": { "type": "string", "minLength": 1 },
+        "block_hash": { "type": "string", "minLength": 1 },
+        "token_transfer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["token_contract", "transfer_from", "transfer_to", "transfer_amount"],
+          "properties": {
+            "token_contract": { "type": "string", "minLength": 1 },
+            "transfer_from": { "type": "string", "minLength": 1 },
+            "transfer_to": { "type": "string", "minLength": 1 },
+            "transfer_amount": { "type": "string", "minLength": 1 }
+          }
+        },
+        "unavailable_reason": { "type": "string", "minLength": 1 },
+        "observed_at_unix_seconds": { "type": "integer" },
+        "statement": { "type": "string", "minLength": 1 }
+      }
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network", "asset", "recipient", "amount", "authorization", "transfer_event"],
+      "properties": {
+        "network": { "enum": ["match", "mismatch", "not_evaluated"] },
+        "asset": { "enum": ["match", "mismatch", "not_evaluated"] },
+        "recipient": { "enum": ["match", "mismatch", "not_evaluated"] },
+        "amount": { "enum": ["match", "mismatch", "not_evaluated"] },
+        "authorization": { "enum": ["linked", "not_evaluated"] },
+        "transfer_event": { "enum": ["match", "mismatch", "not_evaluated"] }
+      }
+    },
+    "terminal_state": {
+      "enum": [
+        "response_write_attempted",
+        "payment_rejected_pre_verification",
+        "verification_rejected",
+        "handler_error_status",
+        "settlement_failed",
+        "payment_required_only"
+      ]
+    },
+    "settlement_failure_reason": {
+      "enum": [
+        "verification_rejected",
+        "verification_exception",
+        "settlement_rejected",
+        "settlement_exception",
+        "handler_failed",
+        "duplicate_settlement",
+        "network_mismatch",
+        "scheme_mismatch",
+        "asset_mismatch",
+        "amount_mismatch",
+        "recipient_mismatch",
+        "missing_authorization"
+      ]
+    },
+    "settlement_response_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "service_result_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "observed_at_unix_seconds": { "type": "integer" }
+  }
+}
