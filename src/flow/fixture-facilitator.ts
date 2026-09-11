@@ -44,6 +44,11 @@ export interface FixtureFacilitatorBehavior {
   readonly throwOnVerify?: string;
   /** Raise from settlement with this message, for the same reason. */
   readonly throwOnSettle?: string;
+  /**
+   * Holds settlement at its entry until released; lets a test place a second request while the
+   * first is in flight, so a concurrency case is deterministic instead of racing real timing.
+   */
+  readonly settlementBarrier?: { readonly arrived: () => void; readonly proceed: Promise<void> };
 }
 
 /**
@@ -170,6 +175,11 @@ class FixtureExactEvmFacilitator implements SchemeNetworkFacilitator {
     requirements: PaymentRequirements,
   ): Promise<SettleResponse> {
     this.calls.settle++;
+    const barrier = this.behavior.settlementBarrier;
+    if (barrier) {
+      barrier.arrived();
+      await barrier.proceed;
+    }
     const identity = authorizationIdentity(payload);
     if (identity !== undefined && this.settledAuthorizations.has(identity)) {
       return {
