@@ -1,6 +1,6 @@
 {
   "name": "x402-base-evidence",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Non-normative reference implementation for x402 v2 exact/EIP-3009 payment evidence on Base, including origin binding, settlement observation, signed PEAC evidence, and offline verification.",

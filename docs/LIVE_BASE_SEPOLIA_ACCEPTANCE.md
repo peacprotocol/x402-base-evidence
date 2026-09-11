@@ -190,7 +190,11 @@ Reading the result correctly:
   document; the release notes name it. Neither commit is signed inside `record.jws` (section 4).
   The verifier at the tagged commit reports three supplied-key consistency checks in addition to
   those recorded in the frozen `verification-report.txt`, which was written by the verifier at the
-  execution source commit; the verdict is the same.
+  execution source commit; the verdict is the same. A verifier newer than the tag (profile
+  `x402-base-evidence/offline-verification/2`, see the README, "Verifier check inventory") prints categories, a chain
+  observation schema check, the native-artifact agreement checks and a fixed established/not
+  established statement; this run passes every added check, and the frozen report inside the asset
+  is deliberately left as the profile-1 verifier wrote it.
 - **The loopback origin is a run fact.** `payment-required.txt`, `payment-signature.txt` and
   `request-binding.json` name `http://127.0.0.1:4021/v1/forecast?region=alpha&units=metric` as the
   resource URL and request authority. That is the local example origin the run actually observed,

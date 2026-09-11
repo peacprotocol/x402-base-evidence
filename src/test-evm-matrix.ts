@@ -772,7 +772,7 @@ recordExecution('EVM-IDEM-001');
       `settle calls ${origin.calls.settle}, verify calls ${origin.calls.verify}`,
     );
 
-    // EVM-IDEM-001 a): the reviewer probe. Base64 of `{extensions: <same extensions>}` only --
+    // EVM-IDEM-001 a): an identifier-only payload. Base64 of `{extensions: <same extensions>}` --
     // no `payload`, so no authorization and no signature at all. It must not be able to read the
     // cached result on the strength of the identifier alone: presentedAuthorization() returns
     // undefined for it, so this layer leaves the map untouched and passes it through to the
@@ -3412,7 +3412,7 @@ console.log('\n  -- native --');
 
 recordExecution('EVM-NATIVE-001');
 {
-  // The reviewer's probe (exactly): a re-signed native payment-signature whose accepted amount and
+  // A signed producer inconsistency: a re-signed native payment-signature whose accepted amount and
   // authorization value both disagree with the record and the observation, while the digest that
   // binds the artifact is refreshed to match, so nothing upstream of the native checks can catch
   // it. This also breaks what the payment-required document advertised, because the accepted

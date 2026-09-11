@@ -64,6 +64,26 @@ counterparties.
   persisted.
 - Observed field values are size-bounded before anything is decoded or digested.
 
+## Cached results and retries
+
+The reference origin implements the x402 payment-identifier extension's deduplication. The extension
+leaves the retrieval rule to the application, so it is stated here.
+
+- A cached settled result is released only to a request presenting the same payment identifier, the
+  same request fingerprint and the same signed EIP-3009 authorization the facilitator verified and
+  settled. An identifier alone, or an identifier with a different authorization, is refused with
+  409 and reaches neither verification nor settlement.
+- Requests under one identifier are serialized through an explicit operation state (`pending`,
+  `completed`, `rejected`, `uncertain`). Overlapping matching retries share one operation. An
+  unknown settlement outcome leaves the identifier `uncertain`; it is neither retried nor released.
+- The captured authorization is bearer-equivalent within the run: whoever holds the exact
+  `PAYMENT-SIGNATURE` value can retrieve that result until the process ends. Evidence bundles are
+  published only after the authorization has been consumed on chain, its window has passed and the
+  origin that served it has stopped. A deployment serving private results needs a stronger retrieval
+  credential than possession of the captured artifact.
+- The store is in-memory, bounded and lost on restart. Durable state, restart recovery,
+  multi-instance coordination and tenant scoping are outside this reference.
+
 ## Verification boundary
 
 This repository captures native x402 artifacts and validates selected structure; computes
@@ -71,7 +91,11 @@ request/result binding documents and deterministic digests; issues a signed PEAC
 those digests; and verifies that record offline under a public key supplied to the verifier.
 
 Verification establishes integrity and internal consistency under the supplied key — never external
-truth. A supplied public key is not a trust anchor.
+truth. A supplied public key is not a trust anchor. When the record claims a settled payment, the
+verifier also decodes the captured native x402 artifacts with a bounded parser and holds their
+terms, authorization, identifier, resource and settlement fields to the record and the observation;
+for any other terminal state they are preserved as presented. The full check inventory, by category,
+is in the README under "Verifier check inventory".
 
 It still does not establish:
 
